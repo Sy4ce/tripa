@@ -1,0 +1,36 @@
+<RCC>
+    <!-- 手写数据：qrc 的路径带上目录名会让资源变成 :/handwrite/handwrite/x.csv，
+         所以每个文件都用 alias 去掉目录前缀，统一成 :/handwrite/x.csv -->
+    <qresource prefix="/handwrite">
+        <file alias="README.txt">handwrite/README.txt</file>
+        <file alias="a.csv">handwrite/a.csv</file>
+        <file alias="b.csv">handwrite/b.csv</file>
+        <file alias="c.csv">handwrite/c.csv</file>
+        <file alias="d.csv">handwrite/d.csv</file>
+        <file alias="e.csv">handwrite/e.csv</file>
+        <file alias="f.csv">handwrite/f.csv</file>
+        <file alias="g.csv">handwrite/g.csv</file>
+        <file alias="h.csv">handwrite/h.csv</file>
+        <file alias="i.csv">handwrite/i.csv</file>
+        <file alias="j.csv">handwrite/j.csv</file>
+        <file alias="k.csv">handwrite/k.csv</file>
+        <file alias="l.csv">handwrite/l.csv</file>
+        <file alias="m.csv">handwrite/m.csv</file>
+        <file alias="n.csv">handwrite/n.csv</file>
+        <file alias="o.csv">handwrite/o.csv</file>
+        <file alias="p.csv">handwrite/p.csv</file>
+        <file alias="q.csv">handwrite/q.csv</file>
+        <file alias="r.csv">handwrite/r.csv</file>
+        <file alias="s.csv">handwrite/s.csv</file>
+        <file alias="t.csv">handwrite/t.csv</file>
+        <file alias="u.csv">handwrite/u.csv</file>
+        <file alias="v.csv">handwrite/v.csv</file>
+        <file alias="w.csv">handwrite/w.csv</file>
+        <file alias="x.csv">handwrite/x.csv</file>
+        <file alias="y.csv">handwrite/y.csv</file>
+        <file alias="z.csv">handwrite/z.csv</file>
+    </qresource>
+    <qresource prefix="/icons">
+        <file alias="tripa.png">icons/tripa.png</file>
+    </qresource>
+</RCC>
