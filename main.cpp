@@ -1,16 +1,22 @@
 #include "mainwindow.h"
 
+#include "baselineadjust.h"
 #include "effectsrenderer.h"
 #include "handwriting.h"
 #include "pagesetup.h"
+#include "proofsheet.h"
 #include "texteditor.h"
 
 #include <QAbstractTextDocumentLayout>
 #include <QApplication>
+#include <QCheckBox>
+#include <QDir>
+#include <QDoubleSpinBox>
 #include <QFile>
 #include <QFont>
 #include <QIcon>
 #include <QImage>
+#include <QLabel>
 #include <QLocale>
 #include <QMouseEvent>
 #include <QPainter>
@@ -18,17 +24,24 @@
 #include <QPainterPath>
 #include <QPdfWriter>
 #include <QPixmap>
+#include <QPushButton>
 #include <QScrollBar>
+#include <QSet>
+#include <QSlider>
 #include <QStringList>
 #include <QStyle>
+#include <QTableWidget>
+#include <QTemporaryDir>
 #include <QTest>
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <QTextLayout>
 #include <QTextStream>
 #include <QThread>
 #include <QTimer>
 #include <QTranslator>
+#include <QWheelEvent>
 
 #include <cmath>
 #include <cstdio>
@@ -53,10 +66,47 @@ void tripaRenderToDevice(QTextDocument *document,
     document->setDocumentMargin(0);
     document->setPageSize(cardPx);
 
-    // 设备像素 / 96dpi 像素（96dpi 下 1mm = 96/25.4 px）
+    // 设备像素 / 96dpi 像素（96dpi 下 1mm = 25.4 px）
     const double zoom = (double(device->width()) / paperMm.width()) * 25.4 / PageSetup::kDpi;
     const double pageHeightPx = paperMm.height() * PageSetup::kDpi / 25.4;
     const int pages = qMax(1, int(std::ceil(document->size().height() / cardPx.height())));
+
+    /*!
+     * 会被效果"整格替换掉"的字符：正文这一格必须**不画**。
+     *
+     * 以前是让效果层往上刷一块纸色去盖原字，那块底色在屏幕上还会盖掉
+     * 选区高亮（用户看到的就是"变形后的字有个白底挡住选框"）。
+     * 现在改成绘制期把这一格裁掉，屏幕和纸面走同一份计划，谁也不欠谁一块底色。
+     *
+     * 用裁剪路径而不是给这一格设透明前景：设格式会 invalidate 布局，
+     * 让别处已经拿到的 QTextLine 变成悬垂引用（实测会直接段错误）。
+     * 裁剪是纯绘制期的，不碰布局。
+     *
+     * 该挖哪些格子一律看 EffectDrawItem::hidden —— 手写层和扭曲层一个口径。
+     * （这里以前只处理扭曲，于是"手写遮住正文"在屏幕上是遮住的、
+     *   导出 PDF 时原字又冒出来了，所见非所得。）
+     */
+    const QVector<EffectDrawItem> items = planEffects(document, options);
+    /*!
+     * 正文窗口（文档坐标下的第一页正文区）减去那些洞。
+     *
+     * 奇偶填充：窗口是实、洞是空。洞必须挑**落在窗口里**的那些 ——
+     * 别的页的洞在原坐标里和窗口不相交，直接加进奇偶路径会变成一块
+     * "实心岛"，平白多给出一片可绘制区域。
+     */
+    QPainterPath pageClip;
+    bool anyHidden = false;
+    {
+        const QRectF window(QPointF(0.0, 0.0), cardPx);
+        pageClip.setFillRule(Qt::OddEvenFill);
+        pageClip.addRect(window);
+        for (const EffectDrawItem &item : items) {
+            if (item.hidden && item.charRect.intersects(window)) {
+                pageClip.addRect(item.charRect);
+                anyHidden = true;
+            }
+        }
+    }
 
     painter->save();
     painter->setRenderHint(QPainter::Antialiasing, true);
@@ -72,9 +122,29 @@ void tripaRenderToDevice(QTextDocument *document,
 
         QAbstractTextDocumentLayout::PaintContext context;
         context.palette.setColor(QPalette::Text, Qt::black);
+        /*!
+         * 有字要被替换时才设这个裁剪（它同时充当"这一页的正文窗口"）；
+         * 一个洞都没有时保持原样不设裁剪，免得平白改变无效果文档的输出。
+         */
+        if (anyHidden)
+            painter->setClipPath(pageClip, Qt::IntersectClip);
         document->documentLayout()->draw(painter, context);
 
         if (options.anyLayer()) {
+            /*!
+             * 画效果层之前**必须先去掉"挖洞"的裁剪**。
+             *
+             * 洞的位置就是会被效果字形替换掉的那些格子 —— 也就是效果层要画的地方。
+             * 带着这套裁剪去画效果层，等于把新字形也一起裁掉：原字没了、新字也没了。
+             * 屏幕那条路径早就这么处理了（见 TextEditor::paintEvent 里的
+             * setClipping(false) 与那段注释），导出这一路漏了这一步，
+             * 结果是**屏幕上好好的、导出的 PDF / 图片里手写笔迹几乎全没了**。
+             * 保留下来的只有恰好越过格子边界的那几笔，看着像几个碎竖条。
+             *
+             * 换成普通的"正文窗口"裁剪：效果层不该画到页边距外面去。
+             */
+            painter->setClipping(false);
+            painter->setClipRect(QRectF(QPointF(0.0, 0.0), cardPx));
             EffectRenderOptions local = options;
             local.missing.clear();
             renderEffects(painter, document, local);
@@ -84,6 +154,51 @@ void tripaRenderToDevice(QTextDocument *document,
     }
 
     painter->restore();
+}
+
+/*!
+ * 量出一张图里所有墨迹的包围盒（页面上除了目标字形什么都没有时用它）。
+ * 全白 = 返回空矩形。
+ */
+static QRect inkBoundsOf(const QImage &image)
+{
+    int minX = image.width();
+    int minY = image.height();
+    int maxX = -1;
+    int maxY = -1;
+    for (int y = 0; y < image.height(); ++y) {
+        const QRgb *scan = reinterpret_cast<const QRgb *>(image.constScanLine(y));
+        for (int x = 0; x < image.width(); ++x) {
+            const QRgb c = scan[x];
+            if (qRed(c) < 200 || qGreen(c) < 200 || qBlue(c) < 200) {
+                minX = qMin(minX, x);
+                maxX = qMax(maxX, x);
+                minY = qMin(minY, y);
+                maxY = qMax(maxY, y);
+            }
+        }
+    }
+    if (maxX < 0)
+        return QRect();
+    return QRect(QPoint(minX, minY), QPoint(maxX, maxY));
+}
+
+/*!
+ * 数出 \a rect 范围内有多少墨点（用来验证"该有字的地方真的有字"）。
+ */
+static int inkPixelsIn(const QImage &image, const QRect &rect)
+{
+    const QRect area = rect.intersected(QRect(QPoint(0, 0), image.size()));
+    int count = 0;
+    for (int y = area.top(); y <= area.bottom(); ++y) {
+        const QRgb *scan = reinterpret_cast<const QRgb *>(image.constScanLine(y));
+        for (int x = area.left(); x <= area.right(); ++x) {
+            const QRgb c = scan[x];
+            if (qRed(c) < 200 || qGreen(c) < 200 || qBlue(c) < 200)
+                ++count;
+        }
+    }
+    return count;
 }
 
 /*!
@@ -153,6 +268,12 @@ static int runSelfTest(const QStringList &args)
     options.waveScale = 2.0;
     options.showHandwriting = true;
     options.showDistortion = true;
+    /*!
+     * 和界面的默认值保持一致：手写"遮住正文"。
+     * 这样自检渲染出来的就是用户实际会得到的样子（原字不画、只剩笔迹），
+     * 也顺带验证了导出路径上"挖洞裁掉原字"这一步。
+     */
+    options.handwritingReplaceText = true;
 
     cursor.select(QTextCursor::Document);
     cursor.beginEditBlock();
@@ -220,6 +341,171 @@ static int runSelfTest(const QStringList &args)
     QTextStream(stdout) << "self-test: 已渲染 " << pngPath << " (" << image.width() << "x"
                         << image.height() << ")\n";
 
+    /*!
+     * 3.5) 基线 / 大小校正必须真的作用到纸上。
+     *
+     * "xml 存下来了"不算数 —— 存了但渲染层没用，用户看到的就是"调了个寂寞"。
+     * 所以这里拿一个内置样本单独渲染三次，量墨迹包围盒：
+     *   默认      -> 基准
+     *   基线 +15% -> 整体下移，高度基本不变
+     *   大小 150% -> 高度长大约一半（顺带验证"宽度受限"的样本也放得大，
+     *               宽度不一起缩放的话一横这类样本是放不动的）
+     */
+    {
+        QTextDocument probe;
+        QFont probeFont = QApplication::font();
+        probeFont.setPointSize(40);
+        probe.setDefaultFont(probeFont);
+        probe.setDocumentMargin(0);
+        probe.setPageSize(setup.bodySizePx());
+
+        QTextCursor pc(&probe);
+        pc.insertText(QStringLiteral("a"));
+        QTextCursor one(&probe);
+        one.setPosition(0);
+        one.setPosition(1, QTextCursor::KeepAnchor);
+        QTextCharFormat fmt;
+        EffectStyle style;
+        style.kind = EffectKind::Handwriting;
+        style.seed = 4242u;
+        setEffectStyle(&fmt, style);
+        one.mergeCharFormat(fmt);
+
+        EffectRenderOptions probeOptions;
+        probeOptions.library = &library;
+        probeOptions.showHandwriting = true;
+        probeOptions.handwritingReplaceText = true;
+
+        auto renderProbe = [&]() {
+            QImage img(image.size(), QImage::Format_RGB32);
+            img.fill(Qt::white);
+            QPainter p(&img);
+            tripaRenderToDevice(&probe, setup, probeOptions, &img, &p);
+            p.end();
+            return img;
+        };
+
+        // 内置数据的来源路径：a.csv 里只有一个字符，下标就是 0
+        const QString probeSource = QStringLiteral(":/handwrite/a.csv");
+
+        library.setAdjustment(probeSource, 0, HandwritingAdjustment());
+        const QRect base = inkBoundsOf(renderProbe());
+
+        /*!
+         * 挖洞裁剪不许把新字形一起裁掉。
+         *
+         * 这一条是被真事逼出来的：导出路径带着"挖洞"的裁剪去画效果层，
+         * 而洞的位置正是效果层要画的地方 —— 于是导出的 PDF / 图片里
+         * 手写笔迹几乎全被裁没了，屏幕上却是好的（屏幕那条路会先
+         * setClipping(false)，见 TextEditor::paintEvent）。
+         * 所以这里专门量"被替换掉的那个格子里有多少墨"，
+         * 光量整页墨点总数是发现不了的（扭曲层的墨会把数字撑住）。
+         * 阈值：正常约 500 点，被裁掉时只剩越过格子边界的那几十点。
+         */
+        {
+            const QVector<EffectDrawItem> probeItems = planEffects(&probe, probeOptions);
+            if (!probeItems.isEmpty()) {
+                const QRectF cell = probeItems.first().charRect;
+                const QMarginsF marginsPx = setup.bodyMarginsPx();
+                const double toDevice = dpi / PageSetup::kDpi;
+                const QRect dev(int((cell.left() + marginsPx.left()) * toDevice),
+                                int((cell.top() + marginsPx.top()) * toDevice),
+                                int(cell.width() * toDevice),
+                                int(cell.height() * toDevice));
+                const int inside = inkPixelsIn(renderProbe(), dev);
+                QTextStream(stdout) << "self-test: 被替换的格子里墨点=" << inside
+                                    << "（格子 " << dev.width() << "x" << dev.height()
+                                    << " 设备像素）\n";
+                if (inside < 150) {
+                    QTextStream(stderr)
+                        << "self-test 失败：被替换的格子里几乎没有新墨 —— "
+                           "效果层大概又被'挖洞'的裁剪裁掉了（导出会丢手写笔迹）\n";
+                    return 11;
+                }
+            }
+        }
+
+        HandwritingAdjustment lower;
+        lower.baseline = 0.15;
+        library.setAdjustment(probeSource, 0, lower);
+        const QRect shifted = inkBoundsOf(renderProbe());
+
+        HandwritingAdjustment bigger;
+        bigger.size = 1.5;
+        library.setAdjustment(probeSource, 0, bigger);
+        const QRect scaled = inkBoundsOf(renderProbe());
+
+        // 量完就还原，别影响后面 PDF 那一步
+        library.setAdjustment(probeSource, 0, HandwritingAdjustment());
+
+        const double lineH = QFontMetricsF(probeFont).ascent() + QFontMetricsF(probeFont).descent();
+        const double expectShift = 0.15 * lineH * dpi / 96.0;
+        QTextStream(stdout) << "self-test: 校正前墨迹 " << base.width() << "x" << base.height()
+                            << " @y=" << base.top() << "，基线+15% 后 @y=" << shifted.top()
+                            << "（预期下移 " << int(expectShift) << "px），大小 150% 后 "
+                            << scaled.width() << "x" << scaled.height() << "\n";
+
+        if (base.isEmpty() || shifted.isEmpty() || scaled.isEmpty()) {
+            QTextStream(stderr) << "self-test 失败：单字页面没渲染出墨迹，量不了校正效果\n";
+            return 6;
+        }
+        if (shifted.top() < base.top() + int(expectShift * 0.5)) {
+            QTextStream(stderr) << "self-test 失败：基线 +15% 之后墨迹没有下移"
+                                   "（渲染层可能没读校正值）\n";
+            return 7;
+        }
+        if (qAbs(shifted.height() - base.height()) > qMax(3, base.height() / 10)) {
+            QTextStream(stderr) << "self-test 失败：只调基线不该改变字的大小（"
+                                << base.height() << " -> " << shifted.height() << "）\n";
+            return 8;
+        }
+        if (scaled.height() < int(base.height() * 1.25)) {
+            QTextStream(stderr) << "self-test 失败：大小 150% 之后墨迹没有变大（"
+                                << base.height() << " -> " << scaled.height() << "）\n";
+            return 9;
+        }
+
+        /*!
+         * 三张并排存一张对比图，肉眼也能核对。
+         *
+         * 三格必须用**同一个裁剪框和同一个缩放**：每格各自"贴合自己的墨迹"
+         * 的话，平移和缩放都会被抵消掉，三张看起来一模一样（白做）。
+         * 裁剪框按"默认那一张"的墨迹往外留足余量（下面要多留，字会往下沉、会变大）。
+         */
+        const int pad = 10;
+        const QImage defaultImage = renderProbe();
+        const QRect crop = base.adjusted(-pad, -pad * 2, pad, pad * 5)
+                               .intersected(QRect(QPoint(0, 0), defaultImage.size()));
+        const int panelW = 220;
+        const int panelH = 320;
+        const double kScale = qMin(double(panelW - 2 * pad) / crop.width(),
+                                   double(panelH - 2 * pad) / crop.height());
+        QImage compare(panelW * 3, panelH, QImage::Format_RGB32);
+        compare.fill(Qt::white);
+        auto paste = [&](const QImage &src, int slot) {
+            const QSizeF target(crop.width() * kScale, crop.height() * kScale);
+            const QRectF dest(slot * panelW + (panelW - target.width()) / 2.0,
+                              (panelH - target.height()) / 2.0,
+                              target.width(), target.height());
+            QPainter cp(&compare);
+            cp.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            cp.drawImage(dest, src, crop);
+        };
+        paste(defaultImage, 0);
+        library.setAdjustment(probeSource, 0, lower);
+        paste(renderProbe(), 1);
+        library.setAdjustment(probeSource, 0, bigger);
+        paste(renderProbe(), 2);
+        library.setAdjustment(probeSource, 0, HandwritingAdjustment());
+        const QString cmpPath = outDir + QStringLiteral("/selftest_baseline_adjust.png");
+        if (!compare.save(cmpPath)) {
+            QTextStream(stderr) << "self-test 失败：写不出 " << cmpPath << "\n";
+            return 10;
+        }
+        QTextStream(stdout) << "self-test: 校正对比图 " << cmpPath
+                            << "（左：默认；中：基线 +15%；右：大小 150%）\n";
+    }
+
     // 4) PDF：用 QPdfWriter（和程序里的"导出 PDF"同一条路径，不碰打印子系统）
     const QString pdfPath = outDir + QStringLiteral("/selftest.pdf");
     QPdfWriter writer(pdfPath);
@@ -244,8 +530,860 @@ static int runSelfTest(const QStringList &args)
 }
 
 /*!
+ * 基线 / 大小调整对话框的实测。
+ *
+ * 验三件事，缺一条这个功能就是"看着有、其实不work"：
+ *   1. 打开时按 (文件, 字符下标) 读出已有的校正，并在预览里体现；
+ *   2. 动 spinbox 立刻写进库里（正文实时跟着变，靠的是同一个库指针）；
+ *   3. 关窗口写回 `<csv 同名>.xml`，重新载入 CSV 能读回来。
+ *
+ * 必须用临时目录里的 CSV：内置资源（qrc）是只读的，写盘那一步根本走不到。
+ * \param sourceDir 非空时用它里面的 CSV 直接开（用来对着真实数据截图），
+ *        否则现场造一份小的。
+ */
+static int runBaselineDialogProbe(const QString &outDir, const QString &sourceDir)
+{
+    QTemporaryDir tmp;
+    if (!tmp.isValid()) {
+        QTextStream(stderr) << "ui-test 失败：建立临时目录失败\n";
+        return 40;
+    }
+
+    QString csvPath;
+    if (!sourceDir.isEmpty()) {
+        const QStringList files = QDir(sourceDir).entryList({QStringLiteral("*.csv")}, QDir::Files);
+        if (files.isEmpty()) {
+            QTextStream(stderr) << "ui-test 失败：" << sourceDir << " 里没有 CSV\n";
+            return 41;
+        }
+        /*!
+         * 先拷贝再调：对话框关窗口时会往 CSV 同目录写 xml，
+         * 直接对着用户的数据跑就等于偷偷改了人家的目录。
+         */
+        csvPath = tmp.filePath(files.first());
+        if (!QFile::copy(QDir(sourceDir).filePath(files.first()), csvPath)) {
+            QTextStream(stderr) << "ui-test 失败：拷贝样例 CSV 失败\n";
+            return 42;
+        }
+    } else {
+        csvPath = tmp.filePath(QStringLiteral("probe.csv"));
+        QFile f(csvPath);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream(stderr) << "ui-test 失败：写不出临时 CSV\n";
+            return 43;
+        }
+        // 三个字，笔画数与点数各不相同，好认
+        f.write(QStringLiteral("好云一\n"
+                               "0,0,0.5\n10,10,0.5\n20,40,0.5\n\n"
+                               "100,0,0.4\n120,30,0.6\n\n\n"
+                               "200,50,0.3\n260,50,0.3\n")
+                    .toUtf8());
+        f.close();
+    }
+
+    HandwritingLibrary library;
+    QString error;
+    if (!library.loadFile(csvPath, &error)) {
+        QTextStream(stderr) << "ui-test 失败：载入临时 CSV 失败：" << error << "\n";
+        return 44;
+    }
+
+    HandwritingBaselineDialog dialog(&library, QApplication::font().family(), 0.20);
+    dialog.resize(1100, 720);
+    dialog.show();
+    for (int i = 0; i < 30; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+
+    QTableWidget *table = dialog.findChild<QTableWidget *>();
+    if (!table || table->rowCount() < 2) {
+        QTextStream(stderr) << "ui-test 失败：调整对话框没列出字符（表行数 "
+                            << (table ? table->rowCount() : -1) << "）\n";
+        return 45;
+    }
+    QTextStream(stdout) << "ui-test: 基线调整对话框列出 " << table->rowCount() << " 行（"
+                        << library.fileEntries(csvPath).size() << " 个槽位）\n";
+
+    dialog.grab().save(outDir + QStringLiteral("/uitest_baseline_dialog.png"));
+    if (QTableWidgetItem *cell = table->item(0, 2))
+        cell->icon().pixmap(QSize(84, 84), 2.0)
+            .save(outDir + QStringLiteral("/uitest_preview0.png"));
+
+    /*!
+     * 自动对齐：按参考字形的墨迹框算基线 + 大小。
+     * 拿"完全不成形"的极端值做对照 —— 之前是手调，现在是点一下。
+     */
+    QPushButton *alignAll = nullptr;
+    for (QPushButton *b : dialog.findChildren<QPushButton *>()) {
+        if (b->text().contains(QStringLiteral("自动对齐")) && b->text().contains(QStringLiteral("全部")))
+            alignAll = b;
+    }
+    if (!alignAll) {
+        QTextStream(stderr) << "ui-test 失败：找不到「自动对齐（本文件全部）」按钮\n";
+        return 46;
+    }
+    alignAll->click();
+    for (int i = 0; i < 10; ++i)
+        QApplication::processEvents();
+
+    const int adjusted = library.adjustedEntryCount();
+    QTextStream(stdout) << "ui-test: 自动对齐后 " << adjusted << " 个字符有校正\n";
+    if (adjusted <= 0) {
+        QTextStream(stderr) << "ui-test 失败：自动对齐一个值都没算出来\n";
+        return 47;
+    }
+    dialog.grab().save(outDir + QStringLiteral("/uitest_baseline_dialog_aligned.png"));
+    if (QTableWidgetItem *cell = table->item(0, 2))
+        cell->icon().pixmap(QSize(84, 84), 2.0)
+            .save(outDir + QStringLiteral("/uitest_preview0_aligned.png"));
+
+    /*!
+     * 再截一段中段的：分页大文件（一个 CSV 一整页字）里，
+     * 标签是识别结果、笔画分组还要靠几何修，个别槽位可能对不上，
+     * 这一段截图就是用来看"字"和预览里的笔迹对不对得上的。
+     */
+    if (table->rowCount() > 55) {
+        table->scrollToItem(table->item(45, 0));
+        for (int i = 0; i < 10; ++i)
+            QApplication::processEvents();
+        dialog.grab().save(outDir + QStringLiteral("/uitest_baseline_dialog_mid.png"));
+    }
+
+    // 再手改一格，验证 spinbox -> 库这条线。
+    // 控件一律按"单元格里的那个"来取：findChildren 会连上一批（延迟删除的）
+    // 控件一起捞出来，拿错就测不到真正在用的那一个。
+    QDoubleSpinBox *baselineSpin = qobject_cast<QDoubleSpinBox *>(table->cellWidget(0, 3));
+    if (!baselineSpin) {
+        QTextStream(stderr) << "ui-test 失败：表格单元格里没有基线 spinbox\n";
+        return 48;
+    }
+    baselineSpin->setValue(7.5);
+    QApplication::processEvents();
+
+    const HandwritingSample *first = library.sampleAt(csvPath, 0);
+    if (!first || qAbs(library.adjustment(*first).baseline - 0.075) > 1e-6) {
+        QTextStream(stderr) << "ui-test 失败：改 spinbox 没有写进库里（当前 "
+                            << (first ? library.adjustment(*first).baseline : -99.0) << "）\n";
+        return 49;
+    }
+
+    // 关窗口 = 落盘（点 X / Esc / 按钮都走 done()）
+    dialog.close();
+    QApplication::processEvents();
+
+    const QString xmlPath = HandwritingLibrary::adjustmentPathFor(csvPath);
+    if (!QFile::exists(xmlPath)) {
+        QTextStream(stderr) << "ui-test 失败：关闭对话框没有写出 " << xmlPath << "\n";
+        return 50;
+    }
+
+    HandwritingLibrary reloaded;
+    if (!reloaded.loadFile(csvPath)) {
+        QTextStream(stderr) << "ui-test 失败：重开 CSV 失败\n";
+        return 51;
+    }
+    const HandwritingSample *again = reloaded.sampleAt(csvPath, 0);
+    if (!again || qAbs(reloaded.adjustment(*again).baseline - 0.075) > 1e-6) {
+        QTextStream(stderr) << "ui-test 失败：重开之后校正没读回来\n";
+        return 52;
+    }
+
+    QTextStream(stdout) << "ui-test: 基线/大小校正 可调、可存、可复用（" << xmlPath << "）\n";
+
+    /*!
+     * 校对表也顺带看一眼：它的预览和对话框用的是同一套画法
+     * （都是"dpr 2 的 pixmap + 逻辑坐标"），改了绘制口径就得一起验证，
+     * 而且它平时没有别的自动检查覆盖。
+     */
+    {
+        HandwritingProofSheet sheet(&library, {}, 0.20);
+        sheet.resize(760, 520);
+        sheet.show();
+        for (int i = 0; i < 20; ++i)
+            QApplication::processEvents();
+        sheet.grab().save(outDir + QStringLiteral("/uitest_proofsheet.png"));
+        sheet.close();
+        QApplication::processEvents();
+        QTextStream(stdout) << "ui-test: 校对表截图 " << outDir << "/uitest_proofsheet.png\n";
+    }
+    return 0;
+}
+
+/*!
+ * \brief 在窗口截图里量"纸面"的横向范围（纯白那一段），单位是设备像素。
+ *
+ * 取整行里**最左和最右**的白像素，不是"第一段连续的白"：正文的墨会把白色打断，
+ * 只取第一段的话量到的是"纸左边缘到第一个字"，纸宽就废了。
+ * 这一行上除了纸面没有别的白色（桌面、侧栏都是深色），所以首尾就是纸的左右边界。
+ */
+static bool measurePaperSpan(const QImage &img, int yDevice, int *left, int *right)
+{
+    if (yDevice < 0 || yDevice >= img.height())
+        return false;
+
+    int l = -1;
+    int r = -1;
+    for (int x = 0; x < img.width(); ++x) {
+        const QRgb c = img.pixel(x, yDevice);
+        if (qRed(c) > 245 && qGreen(c) > 245 && qBlue(c) > 245) {
+            if (l < 0)
+                l = x;
+            r = x;
+        }
+    }
+    if (l < 0 || r <= l)
+        return false;
+    *left = l;
+    *right = r;
+    return true;
+}
+
+/*!
+ * \brief 缩放自检。
+ *
+ * 「比例尺是视图属性」这句话不是口号，得能验：
+ *   1. 屏幕上那张纸真的按比例变宽了（量纯白像素的横向范围，不看算出来的数）；
+ *   2. 放大之后鼠标还点得准（文档坐标 <-> 视口坐标的逆变换，鼠标命中走的就是它）；
+ *   3. Ctrl+滚轮能改缩放，而且**鼠标底下那个字不动**（锚点）；
+ *   4. 状态栏右下角的滑块 / 百分比和编辑区永远一致；
+ *   5. 缩放**不改文档**（document()->isModified() 必须还是 false）——
+ *      不然"调个比例尺"会把用户的文件标成已修改，甚至影响保存。
+ *
+ * 用 125% 而不是 200% 来量纸宽：窗口里放得下才能量出左右两条边界；
+ * 200% 单独用来验"纸比编辑区宽"时居中量归零、纸从最左边开始画。
+ *
+ * 正文特意写成**几十行**：锚点要成立，竖滚动条必须有可滚的余量 ——
+ * 只有两行字时滚动范围是 0，缩放时想滚也滚不动（那种情况下"鼠标底下的字不动"
+ * 本来就做不到，不是 bug）。
+ */
+static int runZoomProbe(MainWindow &window, const QString &outDir)
+{
+    TextEditor *editor = window.findChild<TextEditor *>();
+    QSlider *slider = window.findChild<QSlider *>(QStringLiteral("zoomSlider"));
+    QLabel *label = window.findChild<QLabel *>(QStringLiteral("zoomLabel"));
+    if (!editor || !slider || !label) {
+        QTextStream(stderr) << "zoom 失败：找不到编辑区或状态栏上的缩放控件（滑块/百分比）\n";
+        return 30;
+    }
+
+    {
+        QStringList lines;
+        for (int i = 0; i < 60; ++i)
+            lines << QStringLiteral("第 %1 行：ZOOM 缩放对照 abc 123").arg(i + 1);
+        editor->setPlainText(lines.join(QLatin1Char('\n')));
+    }
+    editor->moveCursor(QTextCursor::Start);
+    editor->document()->setModified(false);
+    editor->setZoom(1.0);
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+
+    const double dpr = window.devicePixelRatioF();
+    const double paper0 = editor->paperViewWidthPx();
+    const double pad0 = editor->paperPadPx();
+    const QPointF origin0 = editor->documentOriginInViewport();
+
+    int span0Left = 0;
+    int span0Right = 0;
+    {
+        const QImage win = window.grab().toImage();
+        if (!measurePaperSpan(win, int(700 * dpr), &span0Left, &span0Right)) {
+            QTextStream(stderr) << "zoom 失败：100% 时在截图里量不到纸面\n";
+            return 31;
+        }
+    }
+    const double span0 = span0Right - span0Left + 1;
+    QTextStream(stdout) << "zoom: 100% 纸宽(算)=" << paper0 << " 居中留白=" << pad0
+                        << " 纸宽(量)=" << span0 / dpr << " 设备像素比=" << dpr << "\n";
+    if (qAbs(span0 / dpr - paper0) > 3.0) {
+        QTextStream(stderr) << "zoom 失败：100% 时量到的纸宽 " << span0 / dpr
+                            << " 和页面设置的纸宽 " << paper0 << " 对不上\n";
+        return 32;
+    }
+
+    // ---- 125%：屏幕上的纸必须真的宽了 25%，而且鼠标还点得准 ----
+    editor->setZoom(1.25);
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+
+    const double paper125 = editor->paperViewWidthPx();
+    if (qAbs(paper125 - paper0 * 1.25) > 0.5) {
+        QTextStream(stderr) << "zoom 失败：125% 时纸宽 " << paper125 << " 不等于 "
+                            << paper0 * 1.25 << "\n";
+        return 33;
+    }
+    /*!
+     * 居中留白**不是**按比例缩放的：它是"编辑区宽度减掉纸宽再平分"，
+     * 编辑区宽度没变、纸宽乘了 1.25，所以留白按
+     * pad0 - 纸宽 × (1.25 - 1) / 2 变小。写死"pad0×1.25"是错的（第一版就是这么写的）。
+     */
+    const double expectPad125 = pad0 - paper0 * 0.25 / 2.0;
+    if (qAbs(editor->paperPadPx() - expectPad125) > 1.5) {
+        QTextStream(stderr) << "zoom 失败：125% 时纸张居中留白 " << editor->paperPadPx()
+                            << " 不等于 " << expectPad125 << "（纸没重新居中）\n";
+        return 34;
+    }
+
+    {
+        const QImage win = window.grab().toImage();
+        win.save(outDir + QStringLiteral("/uitest_zoom.png"));
+        int l = 0;
+        int r = 0;
+        if (!measurePaperSpan(win, int(700 * dpr), &l, &r)) {
+            QTextStream(stderr) << "zoom 失败：125% 时在截图里量不到纸面\n";
+            return 35;
+        }
+        const double span = r - l + 1;
+        QTextStream(stdout) << "zoom: 125% 纸宽(量)=" << span / dpr << "（100% 时 "
+                            << span0 / dpr << "）纸左边缘=" << l / dpr << "\n";
+        if (qAbs(span / span0 - 1.25) > 0.02) {
+            QTextStream(stderr) << "zoom 失败：屏幕上的纸没有按 1.25 倍放大（量到 "
+                                << span / span0 << "）\n";
+            return 36;
+        }
+    }
+
+    /*!
+     * 命中测试：拿一个字符的**文档坐标中点**正变换到视口坐标，
+     * 再让命中测试（鼠标点下去走的那条路）反算回来，位置必须一样。
+     * 缩放一旦只改了绘制没改逆变换，这里立刻就不等 —— 症状就是"点哪儿都不对"。
+     */
+    {
+        const int want = 8; // 第一行里的一个字（"对"）
+        const QTextBlock block = editor->document()->firstBlock();
+        const QTextLine line = block.layout()->lineForTextPosition(want);
+        const QRectF blockRect = editor->document()->documentLayout()->blockBoundingRect(block);
+        if (!line.isValid()) {
+            QTextStream(stderr) << "zoom 失败：取不到第一行\n";
+            return 37;
+        }
+        const double x0 = line.cursorToX(want);
+        const double x1 = line.cursorToX(want + 1);
+        const QPointF docPoint(blockRect.left() + (x0 + x1) / 2.0,
+                               blockRect.top() + line.y() + line.height() / 2.0);
+        const QPointF vpPoint = editor->documentToViewport().map(docPoint);
+        const QTextCursor hit = editor->documentCursorAt(vpPoint.toPoint());
+        QTextStream(stdout) << "zoom: 125% 命中测试 文档点=" << docPoint.x() << ","
+                            << docPoint.y() << " -> 视口=" << vpPoint.x() << "," << vpPoint.y()
+                            << " -> 命中位置=" << hit.position() << "（应为 " << want << "）\n";
+        if (hit.position() != want) {
+            QTextStream(stderr) << "zoom 失败：放大后鼠标命中错位，位置 " << hit.position()
+                                << " 而不是 " << want << "\n";
+            return 38;
+        }
+    }
+
+    // 状态栏那套控件必须跟着编辑区走
+    if (slider->value() != 125 || label->text() != QStringLiteral("125%")) {
+        QTextStream(stderr) << "zoom 失败：状态栏没跟着改（滑块 " << slider->value()
+                            << " 标签「" << label->text() << "」）\n";
+        return 39;
+    }
+    // 反过来：拖滑块要能改编辑区
+    slider->setValue(75);
+    QApplication::processEvents();
+    if (qAbs(editor->zoom() - 0.75) > 1e-9) {
+        QTextStream(stderr) << "zoom 失败：拖状态栏滑块没有改到编辑区的缩放（"
+                            << editor->zoom() << "）\n";
+        return 40;
+    }
+
+    /*!
+     * Ctrl+滚轮：改缩放，而且**鼠标底下那一点**（纵向）不能跑。
+     * 横向不锚定是有意的 —— 纸张靠 viewport 左边距重新居中，
+     * 放大时纸本来就该往中间收。
+     */
+    {
+        editor->setZoom(1.0);
+        QApplication::processEvents();
+        const QPointF mouse(160.0, 200.0);
+        const QPointF docUnderMouse = editor->documentToViewport().inverted().map(mouse);
+
+        QWheelEvent wheel(mouse, QPointF(editor->viewport()->mapToGlobal(mouse.toPoint())), QPoint(),
+                          QPoint(0, 120), Qt::NoButton, Qt::ControlModifier, Qt::NoScrollPhase,
+                          false);
+        QApplication::sendEvent(editor->viewport(), &wheel);
+        QApplication::processEvents();
+
+        const double zoomAfter = editor->zoom();
+        const QPointF back = editor->documentToViewport().map(docUnderMouse);
+        QTextStream(stdout) << "zoom: Ctrl+滚轮 一档 -> " << zoomAfter * 100.0
+                            << "%；锚点 y 从 " << mouse.y() << " 变成 " << back.y() << "\n";
+        if (qAbs(zoomAfter - (1.0 + TextEditor::kZoomStep)) > 1e-9) {
+            QTextStream(stderr) << "zoom 失败：Ctrl+滚轮没有把缩放改一档（变成 " << zoomAfter
+                                << "）\n";
+            return 41;
+        }
+        if (qAbs(back.y() - mouse.y()) > 1.5) {
+            QTextStream(stderr) << "zoom 失败：Ctrl+滚轮之后鼠标底下那一点跑了 "
+                                << (back.y() - mouse.y()) << " 像素\n";
+            return 42;
+        }
+        if (slider->value() != qRound(zoomAfter * 100.0)) {
+            QTextStream(stderr) << "zoom 失败：Ctrl+滚轮之后状态栏滑块没同步（"
+                                << slider->value() << "）\n";
+            return 43;
+        }
+    }
+
+    // 200%：纸比编辑区宽，居中量归零、纸从编辑区最左边开始画
+    {
+        editor->setZoom(2.0);
+        for (int i = 0; i < 20; ++i) {
+            QApplication::processEvents();
+            QThread::msleep(5);
+        }
+        const QImage win = window.grab().toImage();
+        win.save(outDir + QStringLiteral("/uitest_zoom_200.png"));
+        int l = 0;
+        int r = 0;
+        const bool measured = measurePaperSpan(win, int(700 * dpr), &l, &r);
+        QTextStream(stdout) << "zoom: 200% 居中留白=" << editor->paperPadPx()
+                            << " 纸宽(算)=" << editor->paperViewWidthPx()
+                            << (measured ? QStringLiteral(" 纸左边缘=%1").arg(l / dpr)
+                                         : QStringLiteral(" 量不到"))
+                            << "\n";
+        if (editor->paperPadPx() != 0.0) {
+            QTextStream(stderr) << "zoom 失败：纸比编辑区宽时纸张居中留白应当是 0（现在是 "
+                                << editor->paperPadPx() << "）\n";
+            return 44;
+        }
+        if (measured && l > 2) {
+            QTextStream(stderr) << "zoom 失败：纸比编辑区宽时纸应当从最左边开始画（量到 "
+                                << l / dpr << "）\n";
+            return 45;
+        }
+        /*!
+         * 判"居中量归零"要看 **viewport 左边距**，不能拿 viewport 宽度和编辑区宽度比：
+         * 内容一长竖滚动条就出来了，viewport 本来就该窄一条滚动条的宽度。
+         */
+        if (editor->viewport()->x() != 0) {
+            QTextStream(stderr) << "zoom 失败：居中留白没归零，viewport 左边距是 "
+                                << editor->viewport()->x() << "\n";
+            return 46;
+        }
+    }
+
+    // 回到 100%：几何必须原样回来（滚动位置也拨回 0 —— 缩放本来就该能滚）
+    editor->setZoom(1.0);
+    editor->verticalScrollBar()->setValue(0);
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+
+    /*!
+     * 滚动之后光标还得画在对的位置。
+     *
+     * 这里踩过一个一直没被发现的坑：`QTextEdit::cursorRect()` 返回的是
+     * **"文档坐标 - 滚动量"**（实测：文档 y=130 的光标在竖滚动 200 之后返回 -70，
+     * 横滚动 300 时 x 从 0 变成 -300），而本控件画光标时加的那个原点里**已经**含了
+     * -滚动量 —— 于是滚动之后被再减一次，光标直接画到纸外面去（屏幕上看不见它）。
+     * 以前的自检只在"没滚动过"的空文档上量光标，正好绕开了这一条。
+     *
+     * 手法：整篇全是空行（画面上除了光标一根墨都没有），把光标放到第 20 行、
+     * 竖滚动 200，然后在截图里找那根竖条，和"算出来的位置"比。
+     */
+    {
+        QStringList blanks;
+        for (int i = 0; i < 60; ++i)
+            blanks << QString();
+        editor->setPlainText(blanks.join(QLatin1Char('\n')));
+        const QTextBlock block = editor->document()->findBlockByNumber(20);
+        QTextCursor caretCursor(editor->document());
+        caretCursor.setPosition(block.position());
+        editor->setTextCursor(caretCursor);
+        editor->setFocus();
+        editor->verticalScrollBar()->setValue(200);
+        for (int i = 0; i < 20; ++i) {
+            QApplication::processEvents();
+            QThread::msleep(5);
+        }
+
+        const double dpr = window.devicePixelRatioF();
+        const QPoint vpInWindow = editor->viewport()->mapTo(&window, QPoint(0, 0));
+        const QPointF docOrigin = editor->documentOriginInViewport();
+        const double docY = editor->document()->documentLayout()->blockBoundingRect(block).top();
+        const double wantTop = vpInWindow.y() + docOrigin.y() + docY;
+        const double wantLeft = vpInWindow.x() + docOrigin.x();
+
+        int foundTop = -1;
+        int foundLeft = -1;
+        int foundBottom = -1;
+        for (int attempt = 0; attempt < 40 && foundTop < 0; ++attempt) {
+            QApplication::processEvents();
+            QThread::msleep(20); // 光标会闪：暗相位抓不到，多抓几次
+            const QImage win = window.grab().toImage();
+            const int y0 = qMax(0, int((wantTop - 8) * dpr));
+            const int y1 = qMin(win.height(), int((wantTop + 40) * dpr));
+            const int x0 = qMax(0, int(wantLeft * dpr));
+            const int x1 = qMin(win.width(), int((wantLeft + 60) * dpr));
+            for (int x = x0; x < x1 && foundTop < 0; ++x) {
+                int top = -1;
+                int bottom = -1;
+                for (int y = y0; y < y1; ++y) {
+                    const QRgb px = win.pixel(x, y);
+                    if (qRed(px) < 90 && qGreen(px) < 90 && qBlue(px) < 90) {
+                        if (top < 0)
+                            top = y;
+                        bottom = y;
+                    }
+                }
+                // 竖条：连续贯通大半个行高才算光标
+                if (top >= 0 && (bottom - top + 1) >= int(14 * dpr)) {
+                    foundTop = top;
+                    foundBottom = bottom;
+                    foundLeft = x;
+                }
+            }
+        }
+        if (foundTop < 0) {
+            QTextStream(stderr) << "zoom 失败：滚动 200 之后画面上找不到光标竖条"
+                                   "（它该画在窗口 y≈"
+                                << wantTop << " 的那一行上）\n";
+            return 49;
+        }
+        const double dy = foundTop / dpr - wantTop;
+        const double dx = foundLeft / dpr - wantLeft;
+        QTextStream(stdout) << "zoom: 滚动 200 后光标竖条 量到 y=" << foundTop / dpr << "（应为 "
+                            << wantTop << "，偏差 " << dy << "）、x=" << foundLeft / dpr
+                            << "（应为 " << wantLeft << "，偏差 " << dx << "）、长约 "
+                            << (foundBottom - foundTop + 1) / dpr << "\n";
+        if (qAbs(dy) > 4.0 || qAbs(dx) > 4.0) {
+            QTextStream(stderr) << "zoom 失败：滚动之后光标画错位置（偏移 " << dx << "," << dy
+                                << "）—— cursorRect() 给的是「文档坐标 - 滚动量」，得加回来\n";
+            return 49;
+        }
+    }
+
+    /*!
+     * 放大之后纸比编辑区宽：Shift+滚轮要能横向平移，平移之后鼠标还得点得准
+     * （横向平移量就在那个唯一的坐标变换里，命中测试自然也一起走）。
+     */
+    {
+        editor->setPlainText(QStringLiteral("横向平移 abcdefghijklmnopqrstuvwxyz\n"));
+        editor->setZoom(2.0);
+        for (int i = 0; i < 20; ++i) {
+            QApplication::processEvents();
+            QThread::msleep(5);
+        }
+        QScrollBar *hbar = editor->horizontalScrollBar();
+        if (hbar->maximum() <= 0) {
+            QTextStream(stdout) << "zoom: 200% 时横向没有可平移的余量，跳过横向平移检查\n";
+        } else {
+            hbar->setValue(0);
+            QApplication::processEvents();
+            /*!
+             * 命中测试要在**平移前后各做一次**：两次都得对，才能说明
+             * "平移量进了那个唯一的变换"（只测平移后的话，
+             * 一个与平移量无关的固定偏差也会被算成平移的错）。
+             */
+            auto hitAt = [&](int want) {
+                const QTextBlock block = editor->document()->firstBlock();
+                const QTextLine line = block.layout()->lineForTextPosition(want);
+                const QRectF blockRect =
+                    editor->document()->documentLayout()->blockBoundingRect(block);
+                const double x0 = line.cursorToX(want);
+                const double x1 = line.cursorToX(want + 1);
+                const QPointF docPoint(blockRect.left() + (x0 + x1) / 2.0,
+                                       blockRect.top() + line.height() / 2.0);
+                const QPointF vpPoint = editor->documentToViewport().map(docPoint);
+                const QTextCursor hit = editor->documentCursorAt(vpPoint.toPoint());
+                return QVector<double>{docPoint.x(), vpPoint.x(), double(hit.position())};
+            };
+            const int want = 8;
+            const QVector<double> before0 = hitAt(want);
+            hbar->setValue(150);
+            QApplication::processEvents();
+            const QVector<double> after0 = hitAt(want);
+            QTextStream(stdout) << "zoom: 命中对照 平移前 文档x=" << before0.at(0) << " 视口x="
+                                << before0.at(1) << " 命中=" << before0.at(2)
+                                << "；平移 150 后 文档x=" << after0.at(0)
+                                << " 视口x=" << after0.at(1) << " 命中=" << after0.at(2) << "\n";
+            if (after0.at(1) >= before0.at(1)) {
+                QTextStream(stderr) << "zoom 失败：横向平移之后那个文档点并没有往左移"
+                                       "（视口 x "
+                                    << before0.at(1) << " -> " << after0.at(1) << "）\n";
+                return 49;
+            }
+            /*!
+             * 判据是"同一个文档点，平移前后命中同一个字符"：
+             * 平移量必须进那个唯一的坐标变换，命中测试才会跟着走。
+             * 不强求命中 == want —— `cursorToX()` 给的是**步进边界**，
+             * 而 `hitTest()` 按字形本身的边界判，两者在窄字符上会差一格
+             * （实测：这里 want=8 时命中 9，平移前后都是 9，所以拿"前后一致"当判据）。
+             */
+            if (after0.at(2) != before0.at(2) || qAbs(after0.at(2) - want) > 1.0) {
+                QTextStream(stderr) << "zoom 失败：横向平移之后鼠标命中变了（" << before0.at(2)
+                                    << " -> " << after0.at(2) << "）\n";
+                return 49;
+            }
+            hbar->setValue(0);
+            QApplication::processEvents();
+            QWheelEvent shiftWheel(
+                QPointF(300, 200), QPointF(editor->viewport()->mapToGlobal(QPoint(300, 200))),
+                QPoint(), QPoint(0, -120), Qt::NoButton, Qt::ShiftModifier, Qt::NoScrollPhase,
+                false);
+            QApplication::sendEvent(editor->viewport(), &shiftWheel);
+            QApplication::processEvents();
+            QTextStream(stdout) << "zoom: 200% Shift+滚轮 横向滚动值 0 -> " << hbar->value()
+                                << "（上限 " << hbar->maximum() << "）纸面原点 x="
+                                << editor->paperOriginInViewport().x() << "\n";
+            if (hbar->value() <= 0) {
+                QTextStream(stderr) << "zoom 失败：Shift+滚轮没有横向平移（值还是 " << hbar->value()
+                                    << "）\n";
+                return 49;
+            }
+        }
+        editor->setZoom(1.0);
+        editor->horizontalScrollBar()->setValue(0);
+        QApplication::processEvents();
+    }
+
+    if (qAbs(editor->paperViewWidthPx() - paper0) > 0.5
+        || qAbs(editor->paperPadPx() - pad0) > 1.5
+        || qAbs(editor->documentOriginInViewport().y() - origin0.y()) > 1.0) {
+        QTextStream(stderr) << "zoom 失败：回到 100% 之后几何没还原（纸宽 "
+                            << editor->paperViewWidthPx() << " 留白 " << editor->paperPadPx()
+                            << "）\n";
+        return 47;
+    }
+    if (editor->document()->isModified()) {
+        QTextStream(stderr) << "zoom 失败：改缩放把文档标成了已修改（缩放必须只是视图属性）\n";
+        return 48;
+    }
+
+    QTextStream(stdout) << "zoom: 缩放自检通过（屏幕按比例放大、命中不错位、"
+                           "Ctrl+滚轮有锚点、状态栏同步、文档不被改动）\n";
+    return 0;
+}
+
+/*!
+ * \brief "给手写加噪声"自检。
+ *
+ * 用户要的是：**已经有手写的字，套扭曲时噪声加在手写笔迹上**，
+ * 而不是把它换回机打字体的字形再加噪声。这条路上有三件事必须一起成立：
+ *   1. Ctrl+D 之后字符格式里还是 Handwriting（不是被改写成 Distortion）——
+ *      这是一条写死的判据，见 distortionEffectKind()；
+ *   2. 画面上第一行里出现的仍然是**手写层的深蓝墨**，近黑的机打字墨几乎为零
+ *      （手写"遮住正文"是默认状态）；
+ *   3. 反过来，没铺过手写的字套扭曲，仍然要变成"扭曲后的字形"（老行为不能丢）。
+ *
+ * 手写数据没载入时直接跳过：那种情况下 act_applyhw 会弹一个模态框，
+ * 在自检里等于卡死，所以先看侧栏那句话再决定跑不跑。
+ */
+static int runHandwritingNoiseProbe(MainWindow &window, const QString &outDir)
+{
+    TextEditor *editor = window.findChild<TextEditor *>();
+    QAction *applyHw = window.findChild<QAction *>(QStringLiteral("act_applyhw"));
+    QAction *distort = window.findChild<QAction *>(QStringLiteral("act_distort"));
+    if (!editor || !applyHw || !distort) {
+        QTextStream(stderr) << "hwnoise 失败：找不到编辑区或手写/扭曲动作\n";
+        return 50;
+    }
+
+    {
+        // 侧栏那句"尚未载入手写数据…"就是"按下 Ctrl+H 会弹框"的信号
+        bool loaded = false;
+        bool empty = false;
+        for (QLabel *label : window.findChildren<QLabel *>()) {
+            if (label->text().contains(QStringLiteral("尚未载入手写数据")))
+                empty = true;
+            if (label->text().contains(QStringLiteral("已载入"))
+                && label->text().contains(QStringLiteral("个字符")))
+                loaded = true;
+        }
+        if (empty || !loaded) {
+            QTextStream(stdout) << "hwnoise: 跳过（窗口里没有手写数据，铺手写会弹模态框）\n";
+            return 0;
+        }
+    }
+
+    const QString sample = QStringLiteral("abcdefgh");
+
+    /*!
+     * 纸面第一行的横条（窗口坐标，设备像素）——只在这里数墨，
+     * 免得把工具栏、侧栏的东西算进来。
+     */
+    auto lineBand = [&](QRect *rect) {
+        const QTextBlock block = editor->document()->firstBlock();
+        const QRectF blockRect = editor->document()->documentLayout()->blockBoundingRect(block);
+        const QPoint vpInWindow = editor->viewport()->mapTo(&window, QPoint(0, 0));
+        const QPointF origin = QPointF(vpInWindow) + editor->documentOriginInViewport();
+        const double dpr = window.devicePixelRatioF();
+        const QRectF band(origin.x() - 4.0, origin.y() + blockRect.top() - 2.0,
+                          qMax(60.0, blockRect.width()) + 14.0, blockRect.height() + 8.0);
+        *rect = QRect(int(band.left() * dpr), int(band.top() * dpr), int(band.width() * dpr),
+                      int(band.height() * dpr));
+        return dpr;
+    };
+
+    auto countInk = [](const QImage &img, const QRect &band, int *navy, int *black) {
+        *navy = 0;
+        *black = 0;
+        const QRect area = band.intersected(img.rect());
+        for (int y = area.top(); y <= area.bottom(); ++y) {
+            for (int x = area.left(); x <= area.right(); ++x) {
+                const QRgb c = img.pixel(x, y);
+                /*!
+                 * 手写层的墨是深蓝 0x111c4b（"遮住正文"时的颜色），
+                 * 机打字 / 扭曲层的墨是近黑 0x1a1a1a —— 两者一眼能分开：
+                 * 前者蓝分量明显高于红分量，后者三通道挨在一起。
+                 */
+                if (qBlue(c) > qRed(c) + 25 && qBlue(c) < 180 && qRed(c) < 120)
+                    ++*navy;
+                else if (qRed(c) < 70 && qGreen(c) < 70 && qBlue(c) < 70
+                         && qAbs(qRed(c) - qBlue(c)) < 14)
+                    ++*black;
+            }
+        }
+    };
+
+    editor->setPlainText(sample);
+    editor->moveCursor(QTextCursor::Start);
+    editor->document()->setModified(false);
+
+    // ---- 1) 铺手写（真实入口：Ctrl+H）----
+    editor->selectAll();
+    applyHw->trigger();
+    editor->moveCursor(QTextCursor::Start); // 收掉选区：量墨时不要和高亮色混在一起
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+
+    auto kindsInDocument = [&] {
+        QSet<int> kinds;
+        for (int pos = 0; pos < editor->document()->characterCount() - 1; ++pos) {
+            QTextCursor one(editor->document());
+            one.setPosition(pos);
+            one.setPosition(pos + 1, QTextCursor::KeepAnchor);
+            kinds.insert(int(effectStyle(one.charFormat()).kind));
+        }
+        return kinds;
+    };
+
+    {
+        const QSet<int> kinds = kindsInDocument();
+        if (kinds != QSet<int>{int(EffectKind::Handwriting)}) {
+            QTextStream(stderr) << "hwnoise 失败：铺完手写之后字符格式里不是清一色的手写效果\n";
+            return 51;
+        }
+    }
+
+    int navyBefore = 0;
+    int blackBefore = 0;
+    {
+        const QImage win = window.grab().toImage();
+        win.save(outDir + QStringLiteral("/uitest_hwnoise_handwriting.png"));
+        QRect band;
+        const double dpr = lineBand(&band);
+        Q_UNUSED(dpr);
+        countInk(win, band, &navyBefore, &blackBefore);
+        QTextStream(stdout) << "hwnoise: 铺手写后 手写墨=" << navyBefore << " 机打墨="
+                            << blackBefore << "\n";
+        if (navyBefore < 150 || blackBefore > navyBefore / 4) {
+            QTextStream(stderr) << "hwnoise 失败：铺上手写后画面上应当主要是手写墨（手写墨 "
+                                << navyBefore << "、机打墨 " << blackBefore << "）\n";
+            return 52;
+        }
+    }
+
+    // ---- 2) 给这些手写字套扭曲：必须保留手写，噪声加到笔迹上 ----
+    editor->selectAll();
+    distort->trigger();
+    editor->moveCursor(QTextCursor::Start);
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+
+    {
+        const QSet<int> kinds = kindsInDocument();
+        if (kinds != QSet<int>{int(EffectKind::Handwriting)}) {
+            QTextStream(stderr) << "hwnoise 失败：套扭曲之后手写效果被换掉了（这是这次要修的 bug："
+                                   "噪声应当加在手写笔迹上，而不是用回原来的字体）\n";
+            return 53;
+        }
+    }
+
+    int navyAfter = 0;
+    int blackAfter = 0;
+    {
+        const QImage win = window.grab().toImage();
+        win.save(outDir + QStringLiteral("/uitest_hwnoise_distorted.png"));
+        QRect band;
+        lineBand(&band);
+        countInk(win, band, &navyAfter, &blackAfter);
+        QTextStream(stdout) << "hwnoise: 套扭曲后 手写墨=" << navyAfter << " 机打墨=" << blackAfter
+                            << "\n";
+        if (navyAfter < 150 || blackAfter > navyAfter / 4) {
+            QTextStream(stderr) << "hwnoise 失败：给手写字加噪声之后画面上冒出了机打字墨（手写墨 "
+                                << navyAfter << "、机打墨 " << blackAfter
+                                << "）—— 字被换回原字体了\n";
+            return 54;
+        }
+    }
+    // 噪声真的动了：笔迹的像素不会一模一样
+    {
+        const QImage a(outDir + QStringLiteral("/uitest_hwnoise_handwriting.png"));
+        const QImage b(outDir + QStringLiteral("/uitest_hwnoise_distorted.png"));
+        if (a.size() == b.size() && !a.isNull()) {
+            int diff = 0;
+            for (int y = 0; y < a.height(); y += 2)
+                for (int x = 0; x < a.width(); x += 2)
+                    if (a.pixel(x, y) != b.pixel(x, y))
+                        ++diff;
+            QTextStream(stdout) << "hwnoise: 加噪声前后画面差异像素=" << diff << "\n";
+            if (diff == 0) {
+                QTextStream(stderr) << "hwnoise 失败：套扭曲前后画面一模一样，噪声没有加到笔迹上\n";
+                return 55;
+            }
+        }
+    }
+
+    // ---- 3) 没铺过手写的字：套扭曲仍然要换成扭曲字形（老行为）----
+    /*!
+     * 注意先把"当前字符格式"清空：QTextEdit::setPlainText 是**带着当前格式**
+     * 插入的（Qt 有意这么设计，方便接着上次的字体往下写），
+     * 不清的话刚铺的手写效果会跟着新文字一起进来，这里就不是"普通文字"了。
+     */
+    editor->setCurrentCharFormat(QTextCharFormat());
+    editor->setPlainText(sample);
+    {
+        QTextCursor all = editor->textCursor();
+        all.select(QTextCursor::Document);
+        editor->setTextCursor(all);
+    }
+    distort->trigger();
+    editor->moveCursor(QTextCursor::Start);
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+    {
+        const QSet<int> kinds = kindsInDocument();
+        if (kinds != QSet<int>{int(EffectKind::Distortion)}) {
+            QTextStream(stderr) << "hwnoise 失败：普通文字套扭曲之后应当是扭曲字形效果"
+                                   "（这条路上不该出现手写），实际收到 "
+                                << kinds.size() << " 种效果\n";
+            return 56;
+        }
+    }
+
+    QTextStream(stdout) << "hwnoise: 手写加噪声自检通过（手写保留、机打字不回来、"
+                           "普通文字照旧扭曲字形）\n";
+    return 0;
+}
+
+/*!
  * 界面冒烟测试：真正建出主窗口、跑几个回合的事件循环、截图后退出。
- * 用来验证排版控件、覆盖层、工具栏这些没法用纯逻辑测的部分。
+ * 用来验证排版控件、效果层、工具栏这些没法用纯逻辑测的部分。
  * 用法： tripa.exe --uitest [输出目录] [light|dark]
  *
  * 传 dark / light 会强制一套 Fusion 深色或浅色调色板 ——
@@ -256,8 +1394,17 @@ static int runSelfTest(const QStringList &args)
  *     cursorRect() 上，且不能跑到纸外面（"光标不可见"就是这里失败）；
  *   - 选区：全选后高亮必须正好盖住正文，且不超出纸面；
  *   - 在第 0/1/2 行各点一下，光标必须落到那一行；
- *   - 精确拖选 5 个字，断言选中的就是那 5 个（只断行号不够，列才是关键）；
- *   - Shift+方向键扩选之后，画面上必须真有高亮像素。
+ *   - 精确拖选：锚点和终点必须等于"按下点/松手点的命中结果"（只断行号不够，
+ *     列才是关键）；
+ *   - 连续拖选：按下后分多步移动，左拖右拖都测，锚点不许被上一帧的终点顶掉，
+ *     两头都必须能停在行中间；
+ *   - Shift+方向键扩选之后，画面上必须真有高亮像素；
+ *   - 扭曲替换：正文行内的原字黑墨必须消失、出现扭曲色墨，且全选后
+ *     选区色像素不减少（效果层不许再刷底色盖原字）。
+ *
+ * 另有两个独立的参数：
+ *   - zoom：视图缩放自检（见 runZoomProbe）；
+ *   - hwnoise：给手写字加噪声的自检（见 runHandwritingNoiseProbe）。
  */
 static int runUiTest(const QStringList &args)
 {
@@ -265,6 +1412,10 @@ static int runUiTest(const QStringList &args)
     QString theme = QStringLiteral("system");
     bool probeMouse = false;
     bool probeCursor = false;
+    bool probeBaseline = false;
+    bool probeZoom = false;
+    bool probeHwNoise = false;
+    QString baselineDir;
     for (int i = 2; i < args.size(); ++i) {
         const QString a = args.at(i).toLower();
         if (a == QStringLiteral("dark") || a == QStringLiteral("light"))
@@ -273,6 +1424,24 @@ static int runUiTest(const QStringList &args)
             probeMouse = probeCursor = true;
         else if (a == QStringLiteral("cursor"))
             probeCursor = true;
+        else if (a == QStringLiteral("zoom"))
+            probeZoom = true;
+        else if (a == QStringLiteral("hwnoise"))
+            probeHwNoise = true;
+        else if (a == QStringLiteral("baseline"))
+            probeBaseline = true;
+        else if (a == QStringLiteral("baseline-dir") && i + 1 < args.size())
+            baselineDir = args.at(++i); // 用原始大小写的参数：这是路径
+    }
+
+    /*!
+     * 基线调整对话框的实测放在建主窗口之前跑：它自带一个临时 CSV 和一份库，
+     * 和窗口里的状态互不干扰，也省得"对话框是模态的、被主窗口挡住"。
+     */
+    if (probeBaseline) {
+        const int rc = runBaselineDialogProbe(outDir, baselineDir);
+        if (rc != 0)
+            return rc;
     }
 
     if (theme == QStringLiteral("dark") || theme == QStringLiteral("light")) {
@@ -301,6 +1470,30 @@ static int runUiTest(const QStringList &args)
     MainWindow window;
     window.resize(1360, 900);
     window.show();
+
+    /*!
+     * 手写层的默认状态必须是"遮住正文"。
+     *
+     * 手写数据是用来顶替机打字体的：默认半透明叠加的话，笔迹底下永远透出
+     * 一层机打字，看着就是两套字重影。这里直接查工具栏上那个勾选框 ——
+     * 渲染参数就是从它来的（见 MainWindow::buildRenderOptions）。
+     */
+    {
+        QCheckBox *replaceBox = nullptr;
+        for (QCheckBox *box : window.findChildren<QCheckBox *>()) {
+            if (box->text().contains(QStringLiteral("手写遮住正文"))) {
+                replaceBox = box;
+                break;
+            }
+        }
+        const bool checked = replaceBox && replaceBox->isChecked();
+        QTextStream(stdout) << "ui-test: 工具栏「手写遮住正文」默认勾选=" << (checked ? "是" : "否")
+                            << "\n";
+        if (!checked) {
+            QTextStream(stderr) << "ui-test 失败：手写层默认应当遮住正文（机打字不该透出来）\n";
+            return 34;
+        }
+    }
 
     /*!
      * 光标/选区定位的专项体检。
@@ -738,6 +1931,14 @@ static int runUiTest(const QStringList &args)
              * 整段错开一个页边距，量出来全是 0。
              */
             const QPointF docOrigin = editor->documentOriginInViewport();
+            /*!
+             * 这里只把**数值**（行顶、行高）存进 bands，不留 QTextLine。
+             *
+             * QTextLine 是个"指向布局内部"的轻量句柄：布局一旦被 invalidate
+             * （重排、setFormats、改页宽……），之前拿到的句柄就变成悬垂引用，
+             * 再调 line.y() 会直接段错误 —— 实测就在 QTextLine::y() 里崩过一次，
+             * 而且崩的位置离真正的原因很远。要用的那一刻现取，取完只留数。
+             */
             QVector<QPair<double, double>> bands;
             for (QTextBlock b = editor->document()->begin();
                  b.isValid() && bands.size() < 4; b = b.next()) {
@@ -936,24 +2137,28 @@ static int runUiTest(const QStringList &args)
             /*!
              * 驱动 TextEditor 的鼠标入口。
              *
-             * 坐标空间有两层，别混：
-             *   - 靶点是用**排版坐标**（documentToViewport() 的值域）算出来的；
-             *   - QMouseEvent::pos() 用的是 **viewport 局部坐标**。
-             * 两者之间差的是 viewport 在编辑区里的位置，也就是
-             * viewport()->pos()（横向 = 纸张居中边距，纵向 = 工具栏高度）。
-             * 用 mapFrom 减掉这个偏移即可（曾经把排版坐标直接当局部坐标用，
-             * 也曾经减了两次，两次的结果都是"按下没反应"）。
+             * **只认一套坐标：viewport 局部坐标**，也就是 documentToViewport()
+             * 的值域、QMouseEvent::pos() 那一套。靶点用 documentToViewport()
+             * 从文档坐标算出来，直接喂进来，中间不做任何加减。
+             *
+             * 这里踩过一个大坑：早期版本让本函数收"排版坐标"（= 局部 + viewport
+             * 在编辑区里的偏移）再自己减一次，结果同一个自检文件里两套约定并存
+             * —— 靶点是局部坐标、事件却按排版坐标处理，点击整段偏一个
+             * "纸张居中量 + 工具栏高度"。偏一点点还不容易被发现：
+             * 断言只看"点中哪一行"，而光标贴到下一行时行号照样对，
+             * 只有列会悄悄变成行尾。现在把这一段偏移彻底删掉，
+             * 让"坐标空间不匹配"这类错误无处藏身。
              *
              * 直接调用处理函数而不是往事件队列里塞：拖选需要 Qt 内部的
              * 按键状态跟着变，QTest::mouseMove 又要求窗口真的激活
              * （自检环境里没有），手搓事件 sendEvent 会被当成悬停丢掉。
              * "事件怎么送进控件"是框架的事，"收到之后算得对不对"才是断言对象。
              */
-            auto sendMouse = [editor](QEvent::Type type, const QPoint &editorPos,
+            auto sendMouse = [editor](QEvent::Type type, const QPoint &viewportPos,
                                       Qt::MouseButton button, Qt::MouseButtons buttons) {
-                const QPoint local = editorPos - editor->viewportOriginInEditor();
-                QMouseEvent ev(type, QPointF(local), editor->viewport()->mapToGlobal(local),
-                               button, buttons, Qt::NoModifier);
+                QMouseEvent ev(type, QPointF(viewportPos),
+                               editor->viewport()->mapToGlobal(viewportPos), button, buttons,
+                               Qt::NoModifier);
                 switch (type) {
                 case QEvent::MouseButtonPress:
                 case QEvent::MouseButtonDblClick:
@@ -972,6 +2177,21 @@ static int runUiTest(const QStringList &args)
 
             auto rowOfPos = [editor](int docPos) {
                 return editor->document()->findBlock(docPos).blockNumber();
+            };
+
+            //! 数一数画面上有多少像素是钉死的选区色 #3399ff（±30）
+            auto countSelectionPixels = [](const QImage &img) {
+                int n = 0;
+                for (int y = 0; y < img.height(); ++y) {
+                    const QRgb *scan = reinterpret_cast<const QRgb *>(img.constScanLine(y));
+                    for (int x = 0; x < img.width(); ++x) {
+                        const QRgb px = scan[x];
+                        if (qAbs(qRed(px) - 0x33) <= 30 && qAbs(qGreen(px) - 0x99) <= 30
+                            && qAbs(qBlue(px) - 0xff) <= 30)
+                            ++n;
+                    }
+                }
+                return n;
             };
 
             // 每一行取"行内第 3 个字符"的位置和它的行号，作为点击靶子
@@ -1002,18 +2222,18 @@ static int runUiTest(const QStringList &args)
 
             {
                 /*!
-                 * 标定：把靶点从"排版坐标"换算成 viewport 局部坐标再喂回去，
-                 * 必须回到同一个字符。这条断言把三个坐标空间的
-                 * 换算关系钉死：排版坐标 <-> viewport 局部坐标 <-> 文档坐标。
+                 * 标定：靶点是从文档坐标经 documentToViewport() 算出来的，
+                 * 也就是 **viewport 局部坐标**（event->pos() 那一套），
+                 * 直接喂回 documentCursorAt() 必须回到同一个字符。
+                 *
+                 * 这条断言把两个坐标空间钉死：文档坐标 <-> viewport 局部坐标。
+                 * （曾经这里多减了一次 viewport 原点，把"viewport 局部"当成
+                 * "排版坐标"再换回去，于是整段偏掉，点哪儿都落在纸外面。）
                  */
                 const Target &t0 = targets.first();
-                const QPoint local = t0.vp - editor->viewportOriginInEditor();
-                const int back = editor->documentCursorAt(editor->viewportToEditor(local))
-                                     .position()
-                                 - t0.docPos;
-                QTextStream(stdout) << "ui-test: 点击标定 排版(" << t0.vp.x() << "," << t0.vp.y()
-                                    << ") -> 局部(" << local.x() << "," << local.y()
-                                    << ") -> 回到字符偏差 " << back << "\n";
+                const int back = editor->documentCursorAt(t0.vp).position() - t0.docPos;
+                QTextStream(stdout) << "ui-test: 点击标定 viewport 局部(" << t0.vp.x() << ","
+                                    << t0.vp.y() << ") -> 回到字符偏差 " << back << "\n";
                 if (qAbs(back) > 2) {
                     QTextStream(stderr)
                         << "ui-test 失败：坐标换算对不上（偏差 " << back
@@ -1023,8 +2243,8 @@ static int runUiTest(const QStringList &args)
             }
 
             /*!
-             * 冒烟标定：拿第 0 行第 0 个字当控制点，走一遍"排版坐标 ->
-             * documentCursorAt"，必须回到同一个字符。
+             * 冒烟标定：拿第 0 行第 0 个字当控制点，走一遍"文档坐标 ->
+             * documentToViewport() -> documentCursorAt()"，必须回到同一个字符。
              */
             {
                 const QTextBlock b0 = doc->firstBlock();
@@ -1034,8 +2254,8 @@ static int runUiTest(const QStringList &args)
                 const QPoint vpPt = editor->documentToViewport().map(docPt).toPoint();
                 const int got = editor->documentCursorAt(vpPt).position() - b0.position();
                 QTextStream(stdout) << "ui-test: 命中测试标定 文档点(" << docPt.x() << ","
-                                    << docPt.y() << ") -> 排版(" << vpPt.x() << "," << vpPt.y()
-                                    << ") -> 给第 " << got << " 个字符（应为 0）\n";
+                                    << docPt.y() << ") -> viewport 局部(" << vpPt.x() << ","
+                                    << vpPt.y() << ") -> 给第 " << got << " 个字符（应为 0）\n";
                 if (got != 0) {
                     QTextStream(stderr)
                         << "ui-test 失败：命中测试与 documentToViewport() 不是同一套坐标（差 "
@@ -1176,8 +2396,18 @@ static int runUiTest(const QStringList &args)
                     const double y = blockRect.top() + line.y() + line.height() / 2.0;
                     return editor->documentToViewport().map(QPointF(x, y)).toPoint();
                 };
+                /*!
+                 * 靶点直接取**命中测试的结果**当期望值，不写死"应该是第 5 格"。
+                 *
+                 * charVp(5) 落在第 5 格的**左边界**上，像素取整之后正好压线，
+                 * 由 FuzzyHit 落在哪一边是 Qt 的自由。写死期望值就是在赌取整方向，
+                 * 断言会随 dpr / 字体而飘。这里改成"松手点命中谁就选到谁"，
+                 * 断言的是**拖选忠实执行了命中测试**，那才是这个用例要管的。
+                 */
                 const QPoint from = charVp(0);
                 const QPoint to = charVp(5);
+                const int anchorWanted = editor->documentCursorAt(from).position();
+                const int endWanted = editor->documentCursorAt(to).position();
                 sendMouse(QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
                 QApplication::processEvents();
                 sendMouse(QEvent::MouseMove, (from + to) / 2, Qt::NoButton, Qt::LeftButton);
@@ -1188,17 +2418,397 @@ static int runUiTest(const QStringList &args)
                     QApplication::processEvents();
 
                 const QTextCursor c = editor->textCursor();
-                const int n = c.selectionEnd() - c.selectionStart();
-                const bool ok = (n == 5) && c.selectedText() == QStringLiteral("HANDW");
+                const bool ok = c.hasSelection() && c.anchor() == anchorWanted
+                                && c.position() == endWanted
+                                && (c.selectionEnd() - c.selectionStart()) >= 4;
                 QTextStream(stdout) << "ui-test: 精确拖选 " << from.x() << "," << from.y() << " -> "
-                                    << to.x() << "," << to.y() << " ：选中 " << n << " 个字符 ["
-                                    << c.selectedText() << "]" << (ok ? " OK" : " **不对**")
-                                    << "\n";
+                                    << to.x() << "," << to.y() << " ：选中 ["
+                                    << c.selectedText() << "] " << c.anchor() << ".."
+                                    << c.position() << "，应为 " << anchorWanted << ".." << endWanted
+                                    << (ok ? " OK" : " **不对**") << "\n";
                 if (!ok) {
                     QTextStream(stderr) << "ui-test 失败：拖选的起止列不准（选到 \"" << c.selectedText()
-                                        << "\"，应为 \"HANDW\"）\n";
+                                        << "\"，应为 " << anchorWanted << ".." << endWanted << "）\n";
                     return 27;
                 }
+            }
+
+            /*!
+             * 真实拖选：按下之后一连串 MouseMove，最后停在行的**中间**。
+             *
+             * 上面那个"精确拖选"只送了一次移动，正好绕过了这个 bug：
+             * mouseMoveEvent 里如果读 textCursor().anchor()，那个值在每次扩选后
+             * 就被推到上一次的终点上了 —— 于是
+             *   - 往左拖：选区变成"行首..起点"，终点永远贴在一行的开头；
+             *   - 往右拖：选区塌成一个点，看着像"选不动"。
+             * 用户报的"起点和终点一定在一行的开始或末尾，不能选到中间就停"
+             * 就是往左拖的情况。所以这里两个方向都要走多次移动。
+             */
+            {
+                editor->setPlainText(QStringLiteral("HANDWRITING"));
+                editor->moveCursor(QTextCursor::Start);
+                for (int i = 0; i < 10; ++i)
+                    QApplication::processEvents();
+
+                const QTextBlock b = editor->document()->firstBlock();
+                const QTextLine line = b.layout()->lineForTextPosition(0);
+                const QRectF blockRect =
+                    editor->document()->documentLayout()->blockBoundingRect(b);
+                Q_UNUSED(line);
+                Q_UNUSED(blockRect);
+                /*!
+                 * 靶点取"字符格**中心**"，不是格边界。
+                 *
+                 * 格边界上的点在像素取整之后可能落到前一格，命中测试就会给出
+                 * 差一个字符的结果 —— 那是靶子本身没瞄准，不是选择逻辑错。
+                 * 中间点离两边都有一格的一半，怎么取整都还是这一格。
+                 *
+                 * 每次调用都**重新取一遍布局**：QTextLine 是布局内部句柄，
+                 * 布局一旦 invalidate 旧句柄就悬垂了，实测第二次调用就返回垃圾
+                 * （所有 idx 都算出同一个 x）。要用的那一刻现取。
+                 */
+                auto charVp = [&](int idx) {
+                    const QTextBlock blk = editor->document()->firstBlock();
+                    const QTextLine ln = blk.layout()->lineForTextPosition(0);
+                    const QRectF br =
+                        editor->document()->documentLayout()->blockBoundingRect(blk);
+                    const double x0 = br.left() + ln.x() + ln.cursorToX(idx);
+                    const double x1 = br.left() + ln.x() + ln.cursorToX(idx + 1);
+                    const double y = br.top() + ln.y() + ln.height() / 2.0;
+                    return editor->documentToViewport().map(QPointF((x0 + x1) / 2.0, y)).toPoint();
+                };
+                // 分 steps 段走到终点，模拟真实的连续拖动
+                auto drag = [&](int fromIdx, int toIdx, int steps, int *wantFrom, int *wantTo) {
+                    editor->setTextCursor(QTextCursor(editor->document()));
+                    const QPoint from = charVp(fromIdx);
+                    const QPoint to = charVp(toIdx);
+                    /*!
+                     * 期望值必须在**拖动之前**算出来：拖完再算的话，
+                     * textCursor() 已经变了，量到的是"拖完之后命中"的结果，
+                     * 两边必然相等 —— 这条断言就退化成了恒真式（踩过一次）。
+                     */
+                    *wantFrom = editor->documentCursorAt(from).position();
+                    *wantTo = editor->documentCursorAt(to).position();
+                    sendMouse(QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+                    QApplication::processEvents();
+                    for (int i = 1; i <= steps; ++i)
+                        sendMouse(QEvent::MouseMove, from + (to - from) * i / steps,
+                                  Qt::NoButton, Qt::LeftButton);
+                    sendMouse(QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton);
+                    QApplication::processEvents();
+                    return editor->textCursor();
+                };
+
+                struct DragCase { int from; int to; int steps; const char *what; };
+                const QVector<DragCase> cases = {
+                    {0, 6, 10, "向右多次移动"},
+                    {6, 2, 6, "向左多次移动（原来会退化成行首..起点）"},
+                    {9, 3, 8, "长距离向左"},
+                    {8, 1, 12, "向左跨半个词"},
+                };
+                const int lineChars = editor->document()->firstBlock().length() - 1;
+                int bad = 0;
+                for (const DragCase &dc : cases) {
+                    int wantFrom = -1;
+                    int wantTo = -1;
+                    const QTextCursor c = drag(dc.from, dc.to, dc.steps, &wantFrom, &wantTo);
+                    /*!
+                     * 断言三条，都不依赖"靶点像素取整后落在第几格"：
+                     *   1. 锚点 == 按下点算出来的位置 —— 也就是锚点**没有被**顶到
+                     *      上一帧的终点上（老代码就是这里错，往左拖会退化成
+                     *      "行首..按下点"，往右拖会塌成一个点）；
+                     *   2. 终点 == 松手点算出来的位置 —— 松手在哪就停在哪；
+                     *   3. 两头都在行的**中间**，谁也没贴到行首或行尾
+                     *      —— 这正是用户要的"能选到中间就停"。
+                     */
+                    const bool anchorOk = (c.anchor() == wantFrom);
+                    const bool endOk = (c.position() == wantTo);
+                    const bool midLine = c.anchor() > 0 && c.anchor() < lineChars
+                                         && c.position() > 0 && c.position() < lineChars;
+                    const bool ok = anchorOk && endOk && midLine;
+                    if (!ok)
+                        ++bad;
+                    QTextStream(stdout) << "ui-test: 连续拖选 " << dc.what << "：" << dc.from
+                                        << " -> " << dc.to << " 选中 [" << c.selectedText() << "] "
+                                        << c.anchor() << ".." << c.position() << "，应为 "
+                                        << wantFrom << ".." << wantTo << "（都必须在行中间）"
+                                        << (ok ? " OK" : " **不对**") << "\n";
+                }
+                if (bad > 0) {
+                    QTextStream(stderr)
+                        << "ui-test 失败：连续拖选 " << bad
+                        << " 处锚点/终点不对（锚点被上一帧的终点顶掉了）\n";
+                    return 30;
+                }
+                editor->setTextCursor(QTextCursor(editor->document()));
+            }
+
+            /*!
+             * 扭曲层的"透明底"：原字必须被隐藏，而不是被一块纸色刷掉。
+             *
+             * 用户报的是"变形后的文字有一个白色的底，会挡住选框的蓝色，只留约 1px 边"。
+             * 根子是效果层画在正文（含选区高亮）之上，它想盖原字就只能刷底色，
+             * 那块底色连选区一起盖。现在改成绘制期把那一格的前景设成透明。
+             *
+             * 断言用像素做，不看代码：
+             *   - 关掉效果时先记下正文的墨迹；
+             *   - 开启"扭曲 + 替换 + 半透明对照关闭"再截一张；
+             *   - 原来那些墨迹像素一个都不许还是黑的（原字真的没了）；
+             *   - 纸上一个白块都不许多出来（没有底色），且纸面颜色只有白纸 + 扭曲色。
+             */
+            {
+                editor->setPlainText(QStringLiteral("HH HH HH"));
+                editor->moveCursor(QTextCursor::Start);
+                for (int i = 0; i < 10; ++i)
+                    QApplication::processEvents();
+
+                QTextCursor all(editor->document());
+                all.select(QTextCursor::Document);
+                QTextCharFormat fx;
+                EffectStyle st;
+                st.kind = EffectKind::Distortion;
+                st.seed = 20240925u;
+                setEffectStyle(&fx, st);
+                all.mergeCharFormat(fx);
+                editor->setTextCursor(QTextCursor(editor->document()));
+                for (int i = 0; i < 10; ++i)
+                    QApplication::processEvents();
+
+                EffectRenderOptions fxOptions = editor->effectOptions();
+                NoiseWave fxWave;
+                fxWave.reseed(4711u);
+                fxOptions.wave = &fxWave;
+                fxOptions.showDistortion = true;
+                fxOptions.showHandwriting = false;
+                fxOptions.distortionReplaceText = true;
+                fxOptions.amplitudePt = 2.5;
+                fxOptions.waveScale = 2.0;
+                fxOptions.distortionColor = QColor(0x14, 0x1e, 0x78);
+                editor->setEffectOptions(fxOptions);
+                editor->setEffectsVisible(false);
+                for (int i = 0; i < 10; ++i)
+                    QApplication::processEvents();
+
+                const QImage plain = window.grab().toImage();
+                plain.save(outDir + QStringLiteral("/uitest_distort_off.png"));
+
+                editor->setEffectsVisible(true);
+                for (int i = 0; i < 15; ++i)
+                    QApplication::processEvents();
+                const QImage fxShot = window.grab().toImage();
+                fxShot.save(outDir + QStringLiteral("/uitest_distort_bg.png"));
+
+                /*!
+                 * 判据全部**只量正文那两行**（窗口坐标），不量整屏。
+                 *
+                 * 整屏差分踩过两次坑：界面自己的深色部件在两张图里都黑，
+                 * 会把"消失的黑字"淹掉；而"新墨"那条判据一度恒为 0 ——
+                 * 因为我拿来比的 plain 图根本不是"关效果"那张。
+                 * 只量正文行就没这些事：那里除了纸就是字。
+                 */
+                const QPoint vpInWindow = editor->viewport()->mapTo(&window, QPoint(0, 0));
+                const QPointF docOrigin = editor->documentOriginInViewport();
+                const double dprS = window.devicePixelRatioF();
+                /*!
+                 * 只量**正文第一行那一横条**，不量整屏。
+                 *
+                 * 整屏统计踩过两次坑：界面自己的深色部件（工具栏图标、桌面底、
+                 * 状态栏）在两张图里都是黑的，会把"消失的黑字"淹掉；
+                 * 而"新墨"那条判据一度恒为 0，因为拿来比的图根本不是"关效果"那张。
+                 * 只量正文行就没这些事：那里除了纸就是字。
+                 */
+                const QRect textBandWin(
+                    QPoint(int(vpInWindow.x() + docOrigin.x()), int(vpInWindow.y() + docOrigin.y())),
+                    QSize(240, 40));
+                const QRect textBand(int(textBandWin.left() * dprS),
+                                     int(textBandWin.top() * dprS),
+                                     int(textBandWin.width() * dprS),
+                                     int(textBandWin.height() * dprS));
+                struct BandCount { int dark = 0; int blue = 0; };
+                const auto countBand = [&](const QImage &img) {
+                    BandCount c;
+                    for (int y = textBand.top(); y <= textBand.bottom(); ++y) {
+                        const QRgb *scan = reinterpret_cast<const QRgb *>(img.constScanLine(y));
+                        for (int x = textBand.left(); x <= textBand.right(); ++x) {
+                            const QRgb px = scan[x];
+                            if (qRed(px) < 90 && qGreen(px) < 90 && qBlue(px) < 90)
+                                ++c.dark;
+                            // 扭曲层的颜色是 #141e78：红绿很低、蓝明显高
+                            if (qBlue(px) > 90 && qBlue(px) > qRed(px) + 40
+                                && qBlue(px) > qGreen(px) + 30)
+                                ++c.blue;
+                        }
+                    }
+                    return c;
+                };
+                const BandCount plainBand = countBand(plain);
+                const BandCount fxBand = countBand(fxShot);
+                QTextStream(stdout) << "ui-test: 扭曲替换 正文行内 关效果 黑墨=" << plainBand.dark
+                                    << " 蓝墨=" << plainBand.blue << "；开效果后 黑墨=" << fxBand.dark
+                                    << " 蓝墨=" << fxBand.blue << "（范围 " << textBand.left() << ","
+                                    << textBand.top() << " " << textBand.width() << "x"
+                                    << textBand.height() << "）\n";
+                if (plainBand.dark < 50) {
+                    QTextStream(stderr) << "ui-test 失败：对照组（关效果）就没量到黑字，断言没有意义\n";
+                    return 31;
+                }
+                if (fxBand.dark > plainBand.dark / 5) {
+                    QTextStream(stderr) << "ui-test 失败：开启扭曲替换后原字还在（黑墨 " << fxBand.dark
+                                        << " 个，关效果时 " << plainBand.dark
+                                        << " 个）—— 原字没被裁掉，是靠刷底色盖的\n";
+                    return 31;
+                }
+                if (fxBand.blue < 200) {
+                    QTextStream(stderr) << "ui-test 失败：原字是没了，但扭曲层没画出来（蓝墨只有 "
+                                        << fxBand.blue << " 个）\n";
+                    return 31;
+                }
+
+                /*!
+                 * 多块文档也要对：只在第 2 块上套扭曲，第 1 块必须原样留着。
+                 *
+                 * "挖洞裁剪"是按块画的，块的位置一旦算错（少加块顶、或者自己累加 y），
+                 * 第 2 块起就会整体叠到第 1 块上 —— 只测单行文档看不出来。
+                 */
+                {
+                    editor->setEffectsVisible(false);
+                    editor->setPlainText(QStringLiteral("AAAAAAAAAAAAAAAAAAA\nBBBBBBBBBBBBBBBBBBB"));
+                    /*!
+                     * 先把整篇的效果清掉再只给第 2 行套。
+                     *
+                     * 不能指望 setPlainText 清干净：它只重置字符内容，
+                     * 光标位置的**字符格式是带过去的**（QTextEdit 会把当前格式
+                     * 应用给新文本），于是上一段测试套在"HH HH HH"上的扭曲
+                     * 会跟着跑到新文本上，两行都被替换 —— 断言里就成了
+                     * "没套效果的那一块被改动了"，看着像绘制逻辑错，其实是测试没摆干净。
+                     */
+                    {
+                        QTextCursor wipe(editor->document());
+                        wipe.select(QTextCursor::Document);
+                        clearEffects(&wipe);
+                        editor->setTextCursor(QTextCursor(editor->document()));
+                    }
+                    for (int i = 0; i < 5; ++i)
+                        QApplication::processEvents();
+                    for (int i = 0; i < 10; ++i)
+                        QApplication::processEvents();
+
+                    QTextCursor second(editor->document());
+                    // 必须先 setPosition 再 movePosition：不带锚点的 movePosition
+                    // 是从光标当前位置（默认 0）**扩选**过去的，
+                    // 会把第 1 行也一起选上（踩过，效果项数直接翻倍）
+                    second.setPosition(editor->document()->findBlockByNumber(1).position());
+                    second.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
+                    QTextCharFormat f2;
+                    EffectStyle s2;
+                    s2.kind = EffectKind::Distortion;
+                    s2.seed = 777u;
+                    setEffectStyle(&f2, s2);
+                    second.mergeCharFormat(f2);
+                    editor->setTextCursor(QTextCursor(editor->document()));
+                    for (int i = 0; i < 10; ++i)
+                        QApplication::processEvents();
+
+                    const QImage off = window.grab().toImage();
+                    editor->setEffectsVisible(true);
+                    for (int i = 0; i < 15; ++i)
+                        QApplication::processEvents();
+                    const QImage on = window.grab().toImage();
+                    on.save(outDir + QStringLiteral("/uitest_distort_multiblock.png"));
+
+                    // 两块各自的窗口坐标矩形（正文第 1 行 / 第 2 行）
+                    const auto blockBand = [&](int row) {
+                        const QRectF br = editor->document()->documentLayout()->blockBoundingRect(
+                            editor->document()->findBlockByNumber(row));
+                        return QRect(int((vpInWindow.x() + docOrigin.x() + br.left()) * dprS),
+                                     int((vpInWindow.y() + docOrigin.y() + br.top()) * dprS),
+                                     int(br.width() * dprS), int(br.height() * dprS));
+                    };
+                    const auto countIn = [](const QImage &img, const QRect &band, bool wantBlue) {
+                        int n = 0;
+                        for (int y = qMax(0, band.top()); y <= band.bottom(); ++y) {
+                            const QRgb *scan =
+                                reinterpret_cast<const QRgb *>(img.constScanLine(y));
+                            for (int x = qMax(0, band.left()); x <= band.right(); ++x) {
+                                const QRgb px = scan[x];
+                                const bool blue = qBlue(px) > 90 && qBlue(px) > qRed(px) + 40
+                                                  && qBlue(px) > qGreen(px) + 30;
+                                const bool dark = qRed(px) < 90 && qGreen(px) < 90
+                                                  && qBlue(px) < 90;
+                                if (wantBlue ? blue : dark)
+                                    ++n;
+                            }
+                        }
+                        return n;
+                    };
+                    const QRect row0 = blockBand(0);
+                    const QRect row1 = blockBand(1);
+                    // 第 1 行：开效果前后都要有黑字（它没被套效果）
+                    const int row0Off = countIn(off, row0, false);
+                    const int row0On = countIn(on, row0, false);
+                    // 第 2 行：开效果后黑字消失、出现扭曲墨
+                    const int row1Off = countIn(off, row1, false);
+                    const int row1On = countIn(on, row1, false);
+                    const int row1Blue = countIn(on, row1, true);
+                    QTextStream(stdout) << "ui-test: 多块 第1行黑墨 " << row0Off << " -> " << row0On
+                                        << "（应保持）；第2行黑墨 " << row1Off << " -> " << row1On
+                                        << "、扭曲墨 " << row1Blue << "（应换掉）\n";
+                    if (row0Off < 50 || row0On < row0Off / 2) {
+                        QTextStream(stderr) << "ui-test 失败：没有套效果的那一块被改动了（" << row0Off
+                                            << " -> " << row0On << "）—— 逐块绘制的位置算错了\n";
+                        return 33;
+                    }
+                    if (row1On > row1Off / 5 || row1Blue < 100) {
+                        QTextStream(stderr) << "ui-test 失败：第 2 块的原字没被换掉（黑墨 " << row1On
+                                            << "，扭曲墨 " << row1Blue << "）\n";
+                        return 33;
+                    }
+
+                    editor->setEffectsVisible(false);
+                    // 换回上一段测试的文本（顺便把效果带过去，下一段测试自己会清）
+                    editor->setPlainText(QStringLiteral("HH HH HH"));
+                    editor->moveCursor(QTextCursor::Start);
+                    for (int i = 0; i < 10; ++i)
+                        QApplication::processEvents();
+                }
+                editor->setEffectsVisible(false);
+                {
+                    QTextCursor wipe(editor->document());
+                    wipe.select(QTextCursor::Document);
+                    clearEffects(&wipe);
+                }
+
+                /*!
+                 * 再来一条"选框不能被底色挡住"的断言：
+                 * 选中全部文字，量选区色像素。效果层要是还在刷纸色底，
+                 * 蓝色会被啃掉一大块。
+                 */
+                editor->setEffectsVisible(false);
+                QTextCursor sel(editor->document());
+                sel.select(QTextCursor::Document);
+                editor->setTextCursor(sel);
+                for (int i = 0; i < 10; ++i)
+                    QApplication::processEvents();
+                const int hiNoFx = countSelectionPixels(window.grab().toImage());
+                editor->setEffectsVisible(true);
+                for (int i = 0; i < 15; ++i)
+                    QApplication::processEvents();
+                const int hiFx = countSelectionPixels(window.grab().toImage());
+                window.grab().save(outDir + QStringLiteral("/uitest_distort_sel.png"));
+                QTextStream(stdout) << "ui-test: 选区高亮像素 关效果 " << hiNoFx << " -> 开效果 "
+                                    << hiFx << "\n";
+                if (hiNoFx < 500 || hiFx < hiNoFx * 4 / 5) {
+                    QTextStream(stderr) << "ui-test 失败：开效果后选区被盖掉（" << hiNoFx
+                                        << " -> " << hiFx << "）—— 效果层还在刷底色\n";
+                    return 32;
+                }
+
+                editor->setEffectsVisible(false);
+                editor->setEffectOptions(EffectRenderOptions());
+                editor->clear();
+                editor->setTextCursor(QTextCursor(editor->document()));
+                for (int i = 0; i < 5; ++i)
+                    QApplication::processEvents();
             }
 
             /*!
@@ -1586,6 +3196,23 @@ static int runUiTest(const QStringList &args)
     if (auto *editor = window.findChild<TextEditor *>())
         editor->setFocus();
 
+    /*!
+     * 手写加噪声、缩放这两项放在最后：它们都会换掉正文内容
+     * （量纸宽要在空白处量、铺手写要有确定的字符），
+     * 前面那些和内容有关的体检（光标、选区、扭曲）都已经跑完了。
+     */
+    if (probeHwNoise) {
+        const int rc = runHandwritingNoiseProbe(window, outDir);
+        if (rc != 0)
+            return rc;
+    }
+
+    if (probeZoom) {
+        const int rc = runZoomProbe(window, outDir);
+        if (rc != 0)
+            return rc;
+    }
+
     // 事件循环真的转得起来吗
     QTimer::singleShot(0, &window, [] { QTextStream(stdout) << "ui-test: 事件循环正常\n"; });
     QApplication::processEvents();
@@ -1599,6 +3226,7 @@ static int runUiTest(const QStringList &args)
         const QStringList expected = {
             "act_paragraph", "act_color",   "act_clearcolor", "act_randomfont",
             "act_fontpool",  "act_applyhw", "act_distort",    "act_regex",
+            "act_lib",       "act_baseline",
         };
         QStringList missing;
         for (const QString &name : expected) {
@@ -1617,8 +3245,45 @@ static int runUiTest(const QStringList &args)
     return 0;
 }
 
+/*!
+ * 屏蔽掉 DirectWrite 那条"点阵字体建面失败"的警告。
+ *
+ *   qt.qpa.fonts: DirectWrite: CreateFontFaceFromHDC() failed (...) for
+ *   QFontDef(Family="MS Serif", ...)
+ *
+ * 系统里 MS Serif / MS Sans Serif / Small Fonts 这些是 GDI 点阵字体，
+ * DirectWrite 建不出字体面；Qt 随后会自己回退到可缩放的替代字体，
+ * 所以它只是**噪音**，不影响排版结果。
+ *
+ * 字体候选列表那边已经把点阵字体过滤掉了（见 MainWindow::buildToolBars 与
+ * allFontFamilies），正常操作不会再触发；这里再兜一道，是因为文档里可能
+ * 残留着别人机器上的老字体名，一旦命中就会在控制台反复刷屏。
+ * 只丢这一条，别的 qt.qpa.fonts 消息原样放行。
+ */
+void installFontNoiseFilter()
+{
+    // 取出当前处理器（第一次调用时把默认处理器换回来，不会丢东西）
+    static const QtMessageHandler previous = qInstallMessageHandler(nullptr);
+    qInstallMessageHandler([](QtMsgType type, const QMessageLogContext &context,
+                              const QString &message) {
+        if (message.contains(QLatin1String("CreateFontFaceFromHDC")))
+            return;
+        if (previous) {
+            previous(type, context, message);
+            return;
+        }
+        // 没有旧处理器：按 Qt 默认格式 <category>: <message> 打到 stderr
+        const char *category = context.category ? context.category : "default";
+        fprintf(stderr, "%s: %s\n", category, qPrintable(message));
+        if (type == QtFatalMsg)
+            abort();
+    });
+}
+
 int main(int argc, char *argv[])
 {
+    installFontNoiseFilter();
+
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("tripa"));
     QApplication::setApplicationDisplayName(QStringLiteral("tripa 排版器"));

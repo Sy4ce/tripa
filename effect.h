@@ -15,7 +15,7 @@ class QTextCharFormat;
  * \brief 字符级效果（存进 QTextCharFormat 的自定义属性里）。
  *
  * 效果只影响"怎么画"，不改动字符本身：正文字符始终留在文档里，
- * 所以正则、选中、复制、保存都照常工作，而显示时用覆盖层换成
+ * 所以正则、选中、复制、保存都照常工作，而显示时用扭曲/手写笔迹换掉
  * 手写笔迹 / 扭曲后的字形。
  */
 enum class EffectKind {
@@ -44,6 +44,17 @@ EffectStyle effectStyle(const QTextCharFormat &format);
 //! 写入格式里的效果；kind = None 时清除
 void setEffectStyle(QTextCharFormat *format, const EffectStyle &style);
 bool hasEffect(const QTextCharFormat &format);
+
+/*!
+ * \brief 套"扭曲（加噪声）"时，这个字符该用哪种效果。
+ *
+ * **已经有手写效果的字符保留手写**：噪声加到手写笔迹上
+ * （renderEffects 里手写层本来就按噪声波抖，幅度就是工具栏的「噪声幅度」），
+ * 而不是把手写换成"原字体 + 噪声" —— 用户要的"给手写数据加噪声"是这个意思，
+ * 手写笔迹不该在加噪声的一瞬间变回机打字。
+ * 其余字符才换成扭曲原字形。
+ */
+EffectKind distortionEffectKind(const QTextCharFormat &format);
 
 //! 清除整篇文档的效果
 void clearEffects(QTextDocument *document);

@@ -23,7 +23,13 @@ CHARS = "abcdefghijklmnopqrstuvwxyz"
 LINE_GAP = 260          # 字符之间的水平间隔
 ROW_HEIGHT = 1600       # 一个字符分到的高度带（含间隙）
 STEP = 3.0              # 折线采样步长（曲线按弧长采样，之后再用 RDP 抽稀）
-PRESSURE = 0.7
+
+# 笔压（第 3 列）的量级。
+# tripa 把这一列的 0~1 线性映射成笔画粗细（线宽 = 笔压 × 字号 × 工具条上的「笔宽」，
+# 默认系数 0.20），所以这里的数值要和真实采集数据一个量级：
+# getpattern 实测 p25=0.14 / 中位 0.25 / p75=0.32 / max 0.8。
+# 下面按"起笔轻、中段最重、收笔轻"给一条曲线，峰值取 0.45（中位落在 0.35 上下）。
+PRESSURE_PEAK = 0.45
 
 # 一个字符分到的宽度带（按 26 个字母摊开）
 CH = 1000
@@ -256,6 +262,20 @@ def fmt(v):
     return ("%.2f" % v).rstrip('0').rstrip('.')
 
 
+def pressure_profile(count, peak):
+    """一笔之内的力度曲线：起笔轻、中段最重、收笔轻（形状照真实采集数据来）。
+
+    两端留 25% 的底：真实数据收到 0 也无所谓（渲染时还有一条最细线兜着），
+    但折线抽稀之后短笔画可能只剩两三个点，全落在两端的话整笔就是一根发丝。
+    """
+    out = []
+    for i in range(count):
+        u = i / (count - 1) if count > 1 else 0.5
+        env = 0.25 + 0.75 * math.sin(math.pi * u) ** 0.6
+        out.append(peak * env)
+    return out
+
+
 def main():
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'handwrite')
     out_dir = os.path.normpath(out_dir)
@@ -275,8 +295,11 @@ def main():
         for s_index, stroke in enumerate(strokes):
             if s_index > 0:
                 lines.append('')  # 笔画边界：一个空行
-            for (x, y) in stroke:
-                lines.append('%s,%s,%s' % (fmt(x + dx), fmt(y + dy), PRESSURE))
+            # 每笔的峰值略有不同，整篇看起来才不像一个模子刻的
+            peak = PRESSURE_PEAK * (0.85 + 0.15 * (s_index % 3))
+            profile = pressure_profile(len(stroke), peak)
+            for (x, y), p in zip(stroke, profile):
+                lines.append('%s,%s,%.3f' % (fmt(x + dx), fmt(y + dy), p))
                 total_points += 1
             total_strokes += 1
 

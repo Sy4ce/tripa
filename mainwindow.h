@@ -23,9 +23,11 @@ class QDoubleSpinBox;
 class QFontComboBox;
 class QLabel;
 class QLineEdit;
+class QSlider;
 class QSpinBox;
 class QStatusBar;
 class QToolBar;
+class QToolButton;
 
 /*!
  * \brief 排版主窗口。
@@ -48,12 +50,16 @@ public:
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    //! 主题（调色板 / QStyle）变了：自造图标是用调色板颜色画的，得重画
+    void changeEvent(QEvent *event) override;
 
 private slots:
     // 文件
+    void createNewDocument();
+    //! 存盘；返回是否真的存下去了（"另存为"被取消、或写盘失败时为 false）
+    bool saveFile();
+    bool saveFileAs();
     void openFile();
-    void saveFile();
-    void saveFileAs();
     void exportPdf();
     void printDocument();
 
@@ -79,6 +85,8 @@ private slots:
     void applyHandwriting();
     void clearHandwriting();
     void showHandwritingLib();
+    //! 手写笔迹的基线 / 大小调整对话框
+    void showBaselineAdjust();
 
     // 选中
     void selectByRegex();
@@ -96,16 +104,18 @@ private slots:
     void updateStatus();
     //! 文档内容变了：正则匹配区间作废
     void onDocumentChanged();
+    //! 编辑区的缩放变了（滑块 / Ctrl+滚轮）：把状态栏那套控件同步过来
+    void onZoomChanged(double zoom);
 
 private:
     void buildActions();
     void buildMenus();
     void buildToolBars();
+    //! 给动作配图标；主题变化时会被再调用一次
+    void applyActionIcons();
     void buildSelectionDock();
     void buildStatusBar();
     void applyBaseFont(const QFont &font);
-
-    void createNewDocument();
 
     /*!
      * 当前操作的目标区间：
@@ -114,8 +124,38 @@ private:
      *   - 都没有 -> 全文
      */
     QVector<QPair<int, int>> effectRanges() const;
+
+    // ------------------------------------------------------------ 文件（.tripa）
+    //! 这个路径该按 tripa 文档处理吗（扩展名 .tripa，或内容以 <tripaDocument 开头）
+    static bool isTripaPath(const QString &path);
+    //! 存成 .tripa（xml）：正文 + 逐字格式 + 段落 + 页面设置 + 手写/扭曲效果
+    bool saveTripaDocument(const QString &path);
+    //! 读 .tripa；成功时把页面设置、渲染参数、显示开关一起恢复
+    bool loadTripaDocument(const QString &path);
+    //! 新建 / 打开之前问一句"要不要先存"，返回 false = 用户取消了
+    bool maybeSaveChanges(const QString &title);
+    //! 按"本该只显示哪一层"把显示下拉框和两个勾选动作同步过来
+    void syncDisplayControls();
+
+    /*!
+     * 一次效果套用的结果。
+     *
+     * 「套了扭曲」不等于「字被换成了扭曲字形」：已经有手写的字会保留手写，
+     * 噪声加到笔迹上（见 effect.h 的 distortionEffectKind）。
+     * 所以分开记两个数，状态栏才能说实话，显示开关也才知道该开哪一层。
+     */
+    struct EffectApplyResult
+    {
+        int applied = 0;            //!< 本次动过的字符数
+        int noiseOnHandwriting = 0; //!< 其中"保留手写、噪声加到笔迹上"的字符数
+
+        //! 换成 / 仍然是"扭曲字形"的字符数
+        int distorted() const { return applied - noiseOnHandwriting; }
+    };
+
     //! 对若干区间套用同一种效果（perChar 时每个字符一个种子）
-    void applyEffectToRanges(const QVector<QPair<int, int>> &ranges, EffectKind kind, bool perChar);
+    EffectApplyResult applyEffectToRanges(const QVector<QPair<int, int>> &ranges, EffectKind kind,
+                                          bool perChar);
     //! 自动打开对应的显示开关，免得"套了效果却看不见"
     void showEffectLayer(EffectKind kind);
 
@@ -163,8 +203,14 @@ private:
     QDoubleSpinBox *m_waveScaleSpin = nullptr;
     QDoubleSpinBox *m_randomMinSpin = nullptr;
     QDoubleSpinBox *m_randomMaxSpin = nullptr;
+    QDoubleSpinBox *m_pressureWidthSpin = nullptr;
     QLabel *m_statusInfo = nullptr;
     QLabel *m_statusEffects = nullptr;
+    //! 状态栏右下角的缩放（初始 100%）
+    QSlider *m_zoomSlider = nullptr;
+    QLabel *m_zoomLabel = nullptr;
+    QToolButton *m_zoomOutButton = nullptr;
+    QToolButton *m_zoomInButton = nullptr;
     QCheckBox *m_replaceTextCheck = nullptr;
     QCheckBox *m_distortReplaceCheck = nullptr;
     QDockWidget *m_selectionDock = nullptr;

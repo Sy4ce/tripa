@@ -1,12 +1,14 @@
 #include "mainwindow.h"
 
 #include "effect.h"
+#include "baselineadjust.h"
 #include "fontspool.h"
 #include "noise.h"
 #include "pagesetup.h"
 #include "paragraph.h"
 #include "proofsheet.h"
 #include "texteditor.h"
+#include "tripadocument.h"
 
 #include <QAbstractTextDocumentLayout>
 #include <QAction>
@@ -19,6 +21,7 @@
 #include <QDir>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -44,6 +47,7 @@
 #include <QSaveFile>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QStatusBar>
 #include <QStyle>
 #include <QTextBlock>
@@ -52,6 +56,7 @@
 #include <QTextDocument>
 #include <QTextStream>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -59,6 +64,38 @@
 #include <functional>
 
 namespace {
+
+/*!
+ * 工具栏图标的墨色。
+ *
+ * 以前这里写死成深灰 0x2a2f3a，浅色主题下没问题，但深色主题下
+ * 工具栏底色本身就是深灰（Fusion 深色是 0x35393f），图标等于隐形。
+ * 改成跟调色板走：取 ButtonText，再拿 Button 底色核一次对比度 ——
+ * 少数主题的 ButtonText 和 Button 挨得很近，这时按底色明暗兜个底。
+ */
+QColor iconInkColor()
+{
+    const QPalette pal = QApplication::palette();
+    const QColor bg = pal.color(QPalette::Button);
+    QColor ink = pal.color(QPalette::ButtonText);
+
+    if (qAbs(ink.lightness() - bg.lightness()) < 80)
+        ink = bg.lightness() < 128 ? QColor(0xe8, 0xe8, 0xe8) : QColor(0x2a, 0x2f, 0x3a);
+
+    return ink;
+}
+
+//! 深色主题：底色比"中灰"还暗
+bool iconThemeIsDark()
+{
+    return QApplication::palette().color(QPalette::Button).lightness() < 128;
+}
+
+//! 强调色（蘸了色的笔、默认字色蓝）：深色主题下要提亮一档才看得清
+QColor iconAccentColor()
+{
+    return iconThemeIsDark() ? QColor(0x6f, 0xa8, 0xff) : QColor(0x2d, 0x6c, 0xd4);
+}
 
 //! 用代码画一个简单的工具栏图标（不依赖任何图片资源）
 QIcon makeIcon(const std::function<void(QPainter &)> &draw)
@@ -69,7 +106,7 @@ QIcon makeIcon(const std::function<void(QPainter &)> &draw)
 
     QPainter p(&pix);
     p.setRenderHint(QPainter::Antialiasing, true);
-    const QPen pen(QColor(0x2a, 0x2f, 0x3a), 1.7, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    const QPen pen(iconInkColor(), 1.7, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
     p.setPen(pen);
     p.setBrush(Qt::NoBrush);
     draw(p);
@@ -154,8 +191,22 @@ QIcon iconColor()
         p.drawLine(QPointF(6, 14), QPointF(13, 4));
         p.drawLine(QPointF(13, 4), QPointF(16, 7));
         p.drawLine(QPointF(16, 7), QPointF(9, 15));
-        p.setBrush(QColor(0x2d, 0x6c, 0xd4));
+        p.setBrush(iconAccentColor());
         p.drawPolygon(QPolygonF({QPointF(7, 13), QPointF(10, 16), QPointF(6, 16)}));
+    });
+}
+
+//! 剪切：剪刀（两片刀刃在中间交叉，左端两个指环）
+QIcon iconCut()
+{
+    return makeIcon([](QPainter &p) {
+        // 刀尖在右上/右下，交叉点约在 (10.4, 10)
+        p.drawLine(QPointF(7.4, 12.7), QPointF(17.0, 4.0));
+        p.drawLine(QPointF(7.4, 7.3), QPointF(17.0, 16.0));
+        // 指环：空心圆，正好接在刀柄那一头
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(QPointF(5.4, 14.6), 2.6, 2.6);
+        p.drawEllipse(QPointF(5.4, 5.4), 2.6, 2.6);
     });
 }
 
@@ -187,7 +238,16 @@ bool charAllowed(const QChar &c, bool chinese, bool english)
     return false;
 }
 
-//! "随机字体"池：从系统字体里挑出适合正文的字体族（去重、略过 Qt 内部条目）
+/*!
+ * "随机字体"池 / 字体池对话框的候选：从系统字体里挑出适合正文的字体族
+ * （去重、略过 Qt 内部条目、**略过点阵字体**）。
+ *
+ * 点阵字体（MS Serif / MS Sans Serif / Small Fonts …）只有 8/10/12/15 几个固定
+ * 字号，正文要按任意字号排版，选中它们只会得到一堆变形字；而且 Qt 用 DirectWrite
+ * 给这些族建字体面必然失败，控制台会刷
+ * "DirectWrite: CreateFontFaceFromHDC() failed ... Family=\"MS Serif\""。
+ * 与其在渲染时兜底，不如从候选里去掉（和工具栏字体框同一个口径）。
+ */
 QStringList allFontFamilies()
 {
     QStringList pool;
@@ -195,6 +255,8 @@ QStringList allFontFamilies()
     for (const QString &family : all) {
         if (family.startsWith(QLatin1Char('.')) || family.startsWith(QLatin1Char('@')))
             continue; // Qt 的内部条目 / 竖排字体
+        if (!QFontDatabase::isSmoothlyScalable(family))
+            continue; // 点阵字体：排不了任意字号
         if (pool.contains(family))
             continue;
         pool.append(family);
@@ -280,6 +342,31 @@ MainWindow::MainWindow(QWidget *parent)
 }
 
 MainWindow::~MainWindow() = default;
+
+/*!
+ * 主题变了就重画图标。
+ *
+ * Windows 11 深浅色切换、换 QStyle、改 QPalette 都会走到这里；
+ * 自造图标是 RGB 位图不是矢量，不重画就一直是旧配色。
+ */
+void MainWindow::changeEvent(QEvent *event)
+{
+    QMainWindow::changeEvent(event);
+
+    switch (event->type()) {
+    case QEvent::PaletteChange:
+    case QEvent::ApplicationPaletteChange:
+    case QEvent::StyleChange:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    //! 系统深浅色切换（Windows 11 主题变化）只发这个
+    case QEvent::ThemeChange:
+#endif
+        applyActionIcons();
+        break;
+    default:
+        break;
+    }
+}
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
@@ -455,6 +542,10 @@ void MainWindow::buildActions()
     QAction *libAct = addAction(tr("查看手写数据（校对表）…"), "act_lib");
     connect(libAct, &QAction::triggered, this, &MainWindow::showHandwritingLib);
 
+    QAction *baselineAct = addAction(tr("调整手写基线 / 大小…"), "act_baseline");
+    baselineAct->setToolTip(tr("逐字调手写笔迹的基线和大小，校对预览后存到与 CSV 同名的 xml"));
+    connect(baselineAct, &QAction::triggered, this, &MainWindow::showBaselineAdjust);
+
     // 选中
     QAction *regexAct = addAction(tr("用正则表达式选中匹配部分"), "act_regex");
     regexAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+F")));
@@ -544,6 +635,7 @@ void MainWindow::buildMenus()
     hwMenu->addAction(act("act_loadhw"));
     hwMenu->addAction(act("act_reloadhw"));
     hwMenu->addAction(act("act_lib"));
+    hwMenu->addAction(act("act_baseline"));
 
     QMenu *selectMenu = menuBar()->addMenu(tr("选中(&S)"));
     selectMenu->addAction(act("act_regex"));
@@ -574,12 +666,19 @@ void MainWindow::buildMenus()
     });
 }
 
-void MainWindow::buildToolBars()
+/*!
+ * 给动作配图标。
+ *
+ * 单独拆成一个函数，是因为自造图标都是用调色板颜色现画的：
+ * 换主题（含系统深浅色切换、QStyle 变化）后必须重画一遍，
+ * 否则图标会停在旧配色上 —— 深色主题配深色图标就是"按钮看不见"。
+ * 内置动作由 QStyle 提供标准图标，同样跟着主题刷新。
+ */
+void MainWindow::applyActionIcons()
 {
     auto act = [this](const char *name) { return findChild<QAction *>(QString::fromLatin1(name)); };
     QStyle *style = QApplication::style();
 
-    // 给自造动作配图标（内置动作由 QStyle 提供标准图标）
     if (act("act_open"))
         act("act_open")->setIcon(style->standardIcon(QStyle::SP_DialogOpenButton));
     if (act("act_save"))
@@ -588,11 +687,15 @@ void MainWindow::buildToolBars()
         act("act_print")->setIcon(makeIcon([](QPainter &p) {
             p.drawRect(QRectF(5, 2, 10, 5));
             p.drawRect(QRectF(3, 7, 14, 7));
+            /*!
+             * 纸张填白：不管什么主题，纸都是白的，
+             * 这里不能用 palette(Base) —— 深色主题的 Base 是近黑，纸就不像纸了。
+             */
             p.setBrush(Qt::white);
             p.drawRect(QRectF(6, 11, 8, 7));
         }));
     if (act("act_cut"))
-        act("act_cut")->setIcon(style->standardIcon(QStyle::SP_DialogDiscardButton));
+        act("act_cut")->setIcon(iconCut());
     if (act("act_randomfont"))
         act("act_randomfont")->setIcon(iconRandom());
     if (act("act_fontpool"))
@@ -624,6 +727,13 @@ void MainWindow::buildToolBars()
         act("act_cn")->setIcon(iconCn());
     if (act("act_en"))
         act("act_en")->setIcon(iconEn());
+}
+
+void MainWindow::buildToolBars()
+{
+    auto act = [this](const char *name) { return findChild<QAction *>(QString::fromLatin1(name)); };
+
+    applyActionIcons();
 
     QToolBar *toolbar = addToolBar(tr("主工具栏"));
     toolbar->setObjectName(QStringLiteral("mainToolBar"));
@@ -635,6 +745,16 @@ void MainWindow::buildToolBars()
     toolbar->addSeparator();
 
     m_fontCombo = new QFontComboBox(toolbar);
+    /*!
+     * 只列可缩放的字体。
+     *
+     * 系统里那批"点阵字体"（MS Serif / MS Sans Serif / Small Fonts …）只有
+     * 8/10/12/15 这几个固定字号，选它们等于让正文变形；而且 Qt 用 DirectWrite
+     * 给这些族建字体面必然失败，控制台会刷
+     * "DirectWrite: CreateFontFaceFromHDC() failed ... Family=\"MS Serif\""。
+     * 既然后面还要按任意字号排版，干脆别让它们出现在列表里（实测 364 -> 351 项）。
+     */
+    m_fontCombo->setFontFilters(QFontComboBox::ScalableFonts);
     m_fontCombo->setToolTip(tr("字体：作用于选中的文字；没有选区时作用于接下来输入的文字"));
     m_fontCombo->setMinimumWidth(130);
     m_fontCombo->setMaximumWidth(200);
@@ -740,6 +860,34 @@ void MainWindow::buildToolBars()
     });
     fxBar->addWidget(m_waveScaleSpin);
 
+    /*!
+     * 笔宽：笔压 -> 线宽的系数（线宽 = 笔压 × 字号 × 这个系数）。
+     *
+     * 为什么要这个旋钮：不同采集程序导出的 depth 量级差很多 ——
+     * 实测 getpattern 的数据中位数 0.25、峰值 0.8，而内置示例只有 0.1 上下。
+     * 系数写死就会出现"某一份数据糊成一坨、另一份细得看不见"，
+     * 用户没法在界面上救回来。
+     *
+     * 位置放在这一行的**前段**：窗口不宽时工具栏右侧会收进 » 溢出菜单，
+     * 调粗细是要一边看正文一边拖的，不能被挤进去。
+     */
+    fxBar->addWidget(new QLabel(tr("笔宽:"), fxBar));
+    m_pressureWidthSpin = new QDoubleSpinBox(fxBar);
+    m_pressureWidthSpin->setRange(0.0, 1.0);
+    m_pressureWidthSpin->setDecimals(2);
+    m_pressureWidthSpin->setSingleStep(0.02);
+    m_pressureWidthSpin->setValue(0.20);
+    m_pressureWidthSpin->setMaximumWidth(70);
+    m_pressureWidthSpin->setToolTip(tr("笔压换算成笔画粗细的系数：\n"
+                                       "线宽 = 该点笔压 × 字号 × 系数。\n"
+                                       "0.20 = 笔压 1.0 时线宽是字号的 20%（接近钢笔手感）；\n"
+                                       "调 0 则忽略笔压，按字高的固定比例画。"));
+    connect(m_pressureWidthSpin, &QDoubleSpinBox::valueChanged, this, [this] {
+        m_editor->setEffectOptions(buildRenderOptions());
+        m_editor->viewport()->update();
+    });
+    fxBar->addWidget(m_pressureWidthSpin);
+
     fxBar->addWidget(new QLabel(tr("随机字号:"), fxBar));
     m_randomMinSpin = new QDoubleSpinBox(fxBar);
     m_randomMinSpin->setRange(2.0, 300.0);
@@ -758,8 +906,17 @@ void MainWindow::buildToolBars()
     fxBar->addWidget(m_randomMaxSpin);
 
     fxBar->addSeparator();
+    /*!
+     * 手写默认"遮住正文"。
+     *
+     * 手写层是拿来"顶替"机打字体的，默认半透明叠加上去的话，
+     * 底下永远透出一层机打字，看着就是两套字重影。
+     * 取消勾选才变成半透明叠加 —— 那是为了对照"哪些字有手写数据"用的。
+     */
     m_replaceTextCheck = new QCheckBox(tr("手写遮住正文"), fxBar);
-    m_replaceTextCheck->setToolTip(tr("勾选后手写笔迹不透明地盖住原字；不勾选则半透明叠加上去"));
+    m_replaceTextCheck->setChecked(true);
+    m_replaceTextCheck->setToolTip(tr("勾选（默认）：手写笔迹顶替机打字，原字不再画；\n"
+                                      "不勾选：半透明叠在原字上，方便对照"));
     connect(m_replaceTextCheck, &QCheckBox::toggled, this, [this] {
         m_editor->setEffectOptions(buildRenderOptions());
         m_editor->viewport()->update();
@@ -879,12 +1036,86 @@ void MainWindow::buildSelectionDock()
     m_selectionDock = dock;
 }
 
+/*!
+ * 状态栏。
+ *
+ * 右边那组常驻信息（纸张 / 选中 / 效果）之后，是**右下角的缩放**：
+ * 一条滑块 + 百分比，和排版软件的习惯一致 —— 比例尺是"看版面"用的，
+ * 放在视线扫不到的菜单里等于没有。Ctrl+鼠标滚轮是同一个入口
+ * （见 TextEditor::wheelEvent），两边永远同步。
+ */
 void MainWindow::buildStatusBar()
 {
     m_statusInfo = new QLabel(this);
     m_statusEffects = new QLabel(this);
     statusBar()->addPermanentWidget(m_statusInfo);
     statusBar()->addPermanentWidget(m_statusEffects);
+
+    auto *zoomOut = new QToolButton(this);
+    zoomOut->setObjectName(QStringLiteral("zoomOut"));
+    zoomOut->setText(QStringLiteral("−"));
+    zoomOut->setAutoRaise(true);
+    zoomOut->setToolTip(tr("缩小 10%%（Ctrl+鼠标滚轮也行）"));
+    auto *zoomIn = new QToolButton(this);
+    zoomIn->setObjectName(QStringLiteral("zoomIn"));
+    zoomIn->setText(QStringLiteral("+"));
+    zoomIn->setAutoRaise(true);
+    zoomIn->setToolTip(tr("放大 10%%（Ctrl+鼠标滚轮也行）"));
+
+    m_zoomSlider = new QSlider(Qt::Horizontal, this);
+    m_zoomSlider->setObjectName(QStringLiteral("zoomSlider"));
+    /*!
+     * 滑块刻度就是百分比整数，所以 25%..400% 直接映射成 25..400。
+     * 单步 5%：拖起来够细，也不会一拖就跳一大截。
+     */
+    m_zoomSlider->setRange(int(TextEditor::kZoomMin * 100), int(TextEditor::kZoomMax * 100));
+    m_zoomSlider->setSingleStep(5);
+    m_zoomSlider->setPageStep(25);
+    m_zoomSlider->setValue(100);
+    m_zoomSlider->setFixedWidth(120);
+    m_zoomSlider->setToolTip(tr("缩放：只影响屏幕上的显示比例，\n"
+                                "排版、打印、导出 PDF 和保存的文件都不变"));
+
+    m_zoomLabel = new QLabel(this);
+    m_zoomLabel->setObjectName(QStringLiteral("zoomLabel"));
+    m_zoomLabel->setMinimumWidth(46);
+    m_zoomLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_zoomLabel->setToolTip(tr("当前缩放（1.0 = 100%）"));
+
+    statusBar()->addPermanentWidget(zoomOut);
+    statusBar()->addPermanentWidget(m_zoomSlider);
+    statusBar()->addPermanentWidget(zoomIn);
+    statusBar()->addPermanentWidget(m_zoomLabel);
+
+    m_zoomOutButton = zoomOut;
+    m_zoomInButton = zoomIn;
+
+    connect(m_zoomSlider, &QSlider::valueChanged, this, [this](int percent) {
+        m_editor->setZoom(percent / 100.0);
+    });
+    connect(zoomOut, &QToolButton::clicked, this, [this] {
+        m_editor->setZoom(m_editor->zoom() - TextEditor::kZoomStep);
+    });
+    connect(zoomIn, &QToolButton::clicked, this, [this] {
+        m_editor->setZoom(m_editor->zoom() + TextEditor::kZoomStep);
+    });
+    // 反向同步：Ctrl+滚轮改的是编辑区，滑块和百分比要跟着动
+    connect(m_editor, &TextEditor::zoomChanged, this, &MainWindow::onZoomChanged);
+
+    onZoomChanged(m_editor->zoom());
+}
+
+void MainWindow::onZoomChanged(double zoom)
+{
+    const int percent = int(std::lround(zoom * 100.0));
+    if (m_zoomSlider) {
+        // 信号要挡住：不然"滑块 -> 编辑区 -> 滑块"绕一圈，
+        // 拖滑块时会跟自己的取整结果来回顶
+        QSignalBlocker blocker(m_zoomSlider);
+        m_zoomSlider->setValue(percent);
+    }
+    if (m_zoomLabel)
+        m_zoomLabel->setText(QStringLiteral("%1%").arg(percent));
 }
 
 void MainWindow::applyBaseFont(const QFont &font)
@@ -903,18 +1134,167 @@ void MainWindow::applyBaseFont(const QFont &font)
 
 // ---------------------------------------------------------------- 文件
 
+bool MainWindow::isTripaPath(const QString &path)
+{
+    return tripadoc::tripaLooksLikeDocument(path);
+}
+
+/*!
+ * 存成 tripa 文档。
+ *
+ * 和"存成 .txt"的区别就在这一步：.txt 只能装文字本身，
+ * 字体/颜色/段落格式/手写层/扭曲层全都留在了内存里，重开就没了。
+ * 这里把整篇状态写成一个 xml（正文用 Qt 的 HTML 序列化，效果按字符区间记）。
+ */
+bool MainWindow::saveTripaDocument(const QString &path)
+{
+    QString error;
+    if (!tripadoc::tripaSaveDocument(m_editor->document(), path, m_pageSetup,
+                                     buildRenderOptions(), &m_wave, m_seed, &error)) {
+        QMessageBox::critical(this, tr("保存失败"),
+                              tr("无法保存 %1：\n%2").arg(path, error));
+        return false;
+    }
+
+    m_filePath = path;
+    m_editor->document()->setModified(false);
+    setWindowTitle(tr("tripa 排版器 — %1").arg(QFileInfo(path).fileName()));
+    statusBar()->showMessage(tr("已保存 %1（tripa 文档：正文 + 排版 + 手写/扭曲效果）").arg(path),
+                             8000);
+    updateStatus();
+    return true;
+}
+
+/*!
+ * 读 tripa 文档。
+ *
+ * 除了正文，页面设置、噪声波、渲染参数、显示开关也要一起接回界面 ——
+ * 不然"打开后和保存时长得不一样"，那这个格式就白做了。
+ */
+bool MainWindow::loadTripaDocument(const QString &path)
+{
+    tripadoc::DocumentData data;
+    data.pageSetup = m_pageSetup;     // 文件里没写的字段保留当前值
+    data.options = buildRenderOptions();
+    data.options.library = nullptr;   // 手写库是运行时的，不进文件
+    data.seed = m_seed;
+
+    QString error;
+    if (!tripadoc::tripaLoadDocument(m_editor->document(), path, &data, &error)) {
+        QMessageBox::critical(this, tr("打开失败"), tr("无法打开 %1：\n%2").arg(path, error));
+        return false;
+    }
+
+    m_filePath = path;
+    m_seed = data.seed;
+
+    // 文件里有波形就逐字节同一条，没有就按 seed 重建，都没有才换一条新的
+    if (data.wave.isValid())
+        m_wave = data.wave;
+    else
+        m_wave.reseed(m_seed != 0 ? m_seed : QRandomGenerator::global()->generate());
+
+    if (data.pageSetupExplicit) {
+        m_pageSetup = data.pageSetup;
+        m_editor->setPageSetup(m_pageSetup);
+    }
+
+    m_showHandwriting = data.options.showHandwriting;
+    m_showDistortion = data.options.showDistortion;
+    if (m_replaceTextCheck)
+        m_replaceTextCheck->setChecked(data.options.handwritingReplaceText);
+    if (m_distortReplaceCheck)
+        m_distortReplaceCheck->setChecked(data.options.distortionReplaceText);
+    if (m_amplitudeSpin)
+        m_amplitudeSpin->setValue(data.options.amplitudePt);
+    if (m_waveScaleSpin)
+        m_waveScaleSpin->setValue(data.options.waveScale);
+    if (m_pressureWidthSpin)
+        m_pressureWidthSpin->setValue(data.options.pressureToWidth);
+    syncDisplayControls();
+
+    m_editor->setCurrentCharFormat(QTextCharFormat());
+    m_editor->moveCursor(QTextCursor::Start);
+    m_editor->document()->setModified(false);
+    m_editor->setEffectsVisible(true);
+    m_editor->setEffectOptions(buildRenderOptions());
+    setWindowTitle(tr("tripa 排版器 — %1").arg(QFileInfo(path).fileName()));
+    updateStatus();
+
+    QString message = tr("已打开 %1（%2 个字符").arg(path).arg(m_editor->toPlainText().size());
+    if (!data.effectsSummary.isEmpty())
+        message += tr("，其中 %1").arg(data.effectsSummary);
+    message += tr("）");
+    statusBar()->showMessage(message, 10000);
+
+    if (!data.problems.isEmpty()) {
+        QMessageBox::warning(this, tr("文档里有读不回来的东西"),
+                             tr("%1：\n\n%2").arg(QFileInfo(path).fileName(),
+                                                  data.problems.join(QStringLiteral("\n"))));
+    }
+    return true;
+}
+
+/*!
+ * 文档改了就先问一句。
+ *
+ * 新建、打开都会**整篇换掉**当前内容，所以必须问 —— 之前新建有问、打开没问，
+ * 打开一个文件就把没保存的改动直接冲掉了。
+ */
+bool MainWindow::maybeSaveChanges(const QString &title)
+{
+    if (!m_editor->document()->isModified())
+        return true;
+
+    const auto answer = QMessageBox::question(
+        this, title.isEmpty() ? tr("未保存的修改") : title,
+        tr("当前文档已修改，是否先保存？"),
+        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
+        QMessageBox::Save);
+
+    if (answer == QMessageBox::Cancel)
+        return false;
+    if (answer == QMessageBox::Save)
+        return saveFile();
+    return true; // Discard
+}
+
+void MainWindow::syncDisplayControls()
+{
+    if (m_displayCombo) {
+        QSignalBlocker blocker(m_displayCombo);
+        if (m_showHandwriting && m_showDistortion)
+            m_displayCombo->setCurrentIndex(2);
+        else if (m_showHandwriting)
+            m_displayCombo->setCurrentIndex(1);
+        else if (m_showDistortion)
+            m_displayCombo->setCurrentIndex(2);
+        else
+            m_displayCombo->setCurrentIndex(0);
+    }
+    if (auto *a = findChild<QAction *>(QStringLiteral("act_showhw"))) {
+        QSignalBlocker blocker(a);
+        a->setChecked(m_showHandwriting);
+    }
+    if (auto *a = findChild<QAction *>(QStringLiteral("act_showdistort"))) {
+        QSignalBlocker blocker(a);
+        a->setChecked(m_showDistortion);
+    }
+}
+
 void MainWindow::createNewDocument()
 {
-    if (m_editor->document()->isModified()) {
-        const auto answer = QMessageBox::question(this, tr("新建"),
-                                                  tr("当前文档已修改，放弃修改？"),
-                                                  QMessageBox::Yes | QMessageBox::No,
-                                                  QMessageBox::No);
-        if (answer != QMessageBox::Yes)
-            return;
-    }
+    if (!maybeSaveChanges(tr("新建")))
+        return;
+
     m_editor->clear();
     m_filePath.clear();
+    m_pageSetup = PageSetup();
+    m_editor->setPageSetup(m_pageSetup);
+    m_showHandwriting = false;
+    m_showDistortion = false;
+    syncDisplayControls();
+    m_editor->setEffectOptions(buildRenderOptions());
     m_editor->document()->setModified(false);
     setWindowTitle(tr("tripa 排版器 — 未命名"));
     updateStatus();
@@ -922,11 +1302,20 @@ void MainWindow::createNewDocument()
 
 void MainWindow::openFile()
 {
+    if (!maybeSaveChanges(tr("打开")))
+        return;
+
     const QString path = QFileDialog::getOpenFileName(
-        this, tr("打开文本文件"), QDir::homePath(),
-        tr("文本文件 (*.txt *.md *.csv *.log);;所有文件 (*.*)"));
+        this, tr("打开文件"), QDir::homePath(),
+        tr("tripa 排版文档 (*.tripa);;文本文件 (*.txt *.md *.csv *.log);;所有文件 (*.*)"));
     if (path.isEmpty())
         return;
+
+    // .tripa 是"带排版的文档"，走自己的读取路径；其余一律当纯文本
+    if (isTripaPath(path)) {
+        loadTripaDocument(path);
+        return;
+    }
 
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -939,6 +1328,14 @@ void MainWindow::openFile()
     const QString text = in.readAll();
     file.close();
 
+    /*!
+     * 纯文本没有"存过什么效果"可言，载入时必须把效果层关掉：
+     * 留着上篇文档的手写/扭曲显示开关，新打开的文字会顶着旧效果的参数画，
+     * 看着像"打开的文件被改了"。
+     */
+    m_showHandwriting = false;
+    m_showDistortion = false;
+    syncDisplayControls();
     m_editor->setPlainText(text);
     m_editor->setCurrentCharFormat(QTextCharFormat());
     m_editor->moveCursor(QTextCursor::Start);
@@ -947,21 +1344,25 @@ void MainWindow::openFile()
     setWindowTitle(tr("tripa 排版器 — %1").arg(QFileInfo(path).fileName()));
     m_editor->setEffectOptions(buildRenderOptions());
     updateStatus();
-    statusBar()->showMessage(tr("已打开 %1（%2 个字符）").arg(path).arg(text.size()), 6000);
+    statusBar()->showMessage(tr("已打开 %1（%2 个字符，纯文本：不含排版与效果）")
+                                 .arg(path).arg(text.size()),
+                             8000);
 }
 
-void MainWindow::saveFile()
+bool MainWindow::saveFile()
 {
-    if (m_filePath.isEmpty()) {
-        saveFileAs();
-        return;
-    }
+    if (m_filePath.isEmpty())
+        return saveFileAs();
+
+    // 存过 tripa 就继续存 tripa；.txt / .md 之类一律只存文字本身
+    if (isTripaPath(m_filePath))
+        return saveTripaDocument(m_filePath);
 
     QSaveFile file(m_filePath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         QMessageBox::critical(this, tr("保存失败"),
                               tr("无法写入 %1：%2").arg(m_filePath, file.errorString()));
-        return;
+        return false;
     }
     QTextStream out(&file);
     out.setEncoding(QStringConverter::Utf8);
@@ -970,26 +1371,49 @@ void MainWindow::saveFile()
     if (!file.commit()) {
         QMessageBox::critical(this, tr("保存失败"),
                               tr("写入 %1 时出错：%2").arg(m_filePath, file.errorString()));
-        return;
+        return false;
     }
     m_editor->document()->setModified(false);
     setWindowTitle(tr("tripa 排版器 — %1").arg(QFileInfo(m_filePath).fileName()));
-    statusBar()->showMessage(tr("已保存 %1").arg(m_filePath), 5000);
+    statusBar()->showMessage(tr("已保存 %1（纯文本：字体、颜色、手写、扭曲都不进 txt；"
+                                "要连排版一起存请用「另存为」选 tripa 文档）")
+                                 .arg(m_filePath),
+                             10000);
+    return true;
 }
 
-void MainWindow::saveFileAs()
+bool MainWindow::saveFileAs()
 {
     QString suggested = m_filePath;
-    if (suggested.isEmpty())
-        suggested = QDir::homePath() + QStringLiteral("/未命名.txt");
+    if (suggested.isEmpty()) {
+        suggested = QDir::homePath() + QStringLiteral("/未命名.tripa");
+    } else if (!isTripaPath(suggested)) {
+        // 打开的是 .txt：另存为默认升级成 .tripa，排版信息这才存得下
+        suggested = QFileInfo(suggested).absolutePath() + QLatin1Char('/')
+                    + QFileInfo(suggested).completeBaseName() + QStringLiteral(".tripa");
+    }
 
-    const QString path = QFileDialog::getSaveFileName(this, tr("另存为"), suggested,
-                                                      tr("文本文件 (*.txt);;所有文件 (*.*)"));
+    /*!
+     * 先问格式、再问路径：这样"选 tripa 过滤器"就等价于"我要连排版一起存"，
+     * 用户不用自己把 .tripa 敲进文件名里（Qt 的 getSaveFileName 不会自动补后缀）。
+     */
+    const QString tripaFilter = tripadoc::fileDialogFilter();
+    const QString textFilter = tr("纯文本 (*.txt)");
+    QString selectedFilter = tripaFilter;
+
+    QString path = QFileDialog::getSaveFileName(this, tr("另存为"), suggested,
+                                                tripaFilter + QStringLiteral(";;") + textFilter
+                                                    + QStringLiteral(";;")
+                                                    + tr("所有文件 (*.*)"),
+                                                &selectedFilter);
     if (path.isEmpty())
-        return;
+        return false;
+
+    if (selectedFilter == tripaFilter && !isTripaPath(path))
+        path = tripadoc::tripaSuffixWithExtension(path);
 
     m_filePath = path;
-    saveFile();
+    return saveFile();
 }
 
 /*!
@@ -1419,7 +1843,7 @@ void MainWindow::loadHandwritingFromDir()
                                  ? QDir::homePath()
                                  : m_handwritingDir;
     const QString dir = QFileDialog::getExistingDirectory(
-        this, tr("选择存放手写 CSV 的目录"), startDir,
+        this, tr("选择存放手写 CSV 的目录（含子目录）"), startDir,
         QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
     if (dir.isEmpty())
         return;
@@ -1428,7 +1852,7 @@ void MainWindow::loadHandwritingFromDir()
     const int loaded = m_library.loadDir(dir, &problems);
     if (loaded == 0) {
         QMessageBox::warning(this, tr("没有找到手写数据"),
-                             tr("目录里没有可用的 CSV：\n%1\n\n"
+                             tr("目录（含子目录）里没有可用的 CSV：\n%1\n\n"
                                 "CSV 需要是 getpattern 项目导出的格式：\n"
                                 "第 1 行是字符标签，之后每行 x,y,pressure，空行分隔笔画。")
                                  .arg(dir));
@@ -1438,7 +1862,7 @@ void MainWindow::loadHandwritingFromDir()
     m_handwritingDir = dir;
     m_editor->setEffectOptions(buildRenderOptions());
 
-    QString message = tr("从 %1 载入 %2 个 CSV 文件。\n当前共 %3 个字符 / %4 份样本。")
+    QString message = tr("从 %1（含子目录）载入 %2 个 CSV 文件。\n当前共 %3 个字符 / %4 份样本。")
                           .arg(dir)
                           .arg(loaded)
                           .arg(m_library.characterCount())
@@ -1555,6 +1979,7 @@ void MainWindow::applyHandwriting()
     // 每次应用换一批样本，同一次应用内同一个字也是同一个样本（稳定）
     m_seed = QRandomGenerator::global()->generate();
     applyEffectToRanges(ranges, EffectKind::Handwriting, true);
+    showEffectLayer(EffectKind::Handwriting);
 
     const QStringList missingAll = collectMissingHandwriting();
     QString message = tr("已为 %1 个字符铺上手写笔迹").arg(affected);
@@ -1599,11 +2024,50 @@ void MainWindow::clearHandwriting()
 void MainWindow::showHandwritingLib()
 {
     const QStringList missing = collectMissingHandwriting();
-    HandwritingProofSheet sheet(&m_library, missing, this);
+    HandwritingProofSheet sheet(&m_library, missing,
+                                m_pressureWidthSpin ? m_pressureWidthSpin->value() : 0.20, this);
     connect(&sheet, &HandwritingProofSheet::reloadRequested,
             this, &MainWindow::loadHandwritingFromDir);
     sheet.exec();
     m_editor->setEffectOptions(buildRenderOptions());
+    updateStatus();
+}
+
+/*!
+ * 基线 / 大小调整。
+ *
+ * 对话框直接改 m_library 里的校正值，正文这边**不用重建渲染参数** ——
+ * EffectRenderOptions 里存的是库的指针，每次重绘现查，
+ * 所以这里只要把视口重画一遍就能实时看到（拖 spinbox 时每改一格都在刷）。
+ */
+void MainWindow::showBaselineAdjust()
+{
+    if (m_library.sampleCount() == 0) {
+        QMessageBox::information(this, tr("还没有手写数据"),
+                                 tr("先用「手写 → 载入手写数据（CSV 目录）」载入 getpattern "
+                                    "导出的 CSV，再来调基线。"));
+        return;
+    }
+
+    HandwritingBaselineDialog dialog(&m_library,
+                                     m_fontCombo ? m_fontCombo->currentFont().family()
+                                                 : QApplication::font().family(),
+                                     m_pressureWidthSpin ? m_pressureWidthSpin->value() : 0.20,
+                                     this);
+    connect(&dialog, &HandwritingBaselineDialog::adjustmentsChanged,
+            this, [this] { m_editor->viewport()->update(); });
+    connect(&dialog, &HandwritingBaselineDialog::adjustmentsSaved,
+            this, [this](const QStringList &xmlFiles) {
+                m_editor->viewport()->update();
+                updateStatus();
+                statusBar()->showMessage(tr("已保存手写校正：%1")
+                                             .arg(xmlFiles.join(QStringLiteral("、"))),
+                                         8000);
+            });
+    dialog.exec();
+
+    m_editor->setEffectOptions(buildRenderOptions());
+    m_editor->viewport()->update();
     updateStatus();
 }
 
@@ -1773,36 +2237,48 @@ double MainWindow::waveScale() const
     return m_waveScaleSpin ? m_waveScaleSpin->value() : 2.0;
 }
 
-void MainWindow::applyEffectToRanges(const QVector<QPair<int, int>> &ranges,
-                                     EffectKind kind,
-                                     bool perChar)
+MainWindow::EffectApplyResult MainWindow::applyEffectToRanges(const QVector<QPair<int, int>> &ranges,
+                                                             EffectKind kind,
+                                                             bool perChar)
 {
+    EffectApplyResult result;
     if (ranges.isEmpty())
-        return;
+        return result;
 
     QTextCursor work(m_editor->document());
     work.beginEditBlock();
-    int count = 0;
     for (const auto &range : ranges) {
         for (int pos = range.first; pos < range.second; ++pos) {
             QTextCursor one(m_editor->document());
             one.setPosition(pos);
             one.setPosition(pos + 1, QTextCursor::KeepAnchor);
 
+            /*!
+             * 套扭曲时，已经有手写的字符**保留手写**（见 distortionEffectKind）：
+             * 噪声加到手写笔迹上，而不是把手写换成"原字体 + 噪声"。
+             *
+             * 种子照样换一个新的：手写层的噪声波是按字符种子现生成的
+             * （见 renderEffects 里的 localWave），换了种子就换了一种抖法 ——
+             * "换一条噪声波并重新扭曲"因此对手写同样有效。
+             */
             EffectStyle style;
-            style.kind = kind;
+            style.kind = (kind == EffectKind::Distortion)
+                             ? distortionEffectKind(one.charFormat())
+                             : kind;
             style.seed = perChar ? (m_seed + quint32(pos) * 2654435761u) : m_seed;
 
             QTextCharFormat fmt;
             setEffectStyle(&fmt, style);
             one.mergeCharFormat(fmt);
-            ++count;
+
+            ++result.applied;
+            if (kind == EffectKind::Distortion && style.kind == EffectKind::Handwriting)
+                ++result.noiseOnHandwriting;
         }
     }
     work.endEditBlock();
 
-    showEffectLayer(kind);
-    Q_UNUSED(count);
+    return result;
 }
 
 void MainWindow::showEffectLayer(EffectKind kind)
@@ -1812,25 +2288,7 @@ void MainWindow::showEffectLayer(EffectKind kind)
     else if (kind == EffectKind::Distortion)
         m_showDistortion = true;
 
-    if (m_displayCombo) {
-        QSignalBlocker blocker(m_displayCombo);
-        if (m_showHandwriting && m_showDistortion)
-            m_displayCombo->setCurrentIndex(2);
-        else if (m_showHandwriting)
-            m_displayCombo->setCurrentIndex(1);
-        else if (m_showDistortion)
-            m_displayCombo->setCurrentIndex(2);
-        else
-            m_displayCombo->setCurrentIndex(0);
-    }
-    if (auto *a = findChild<QAction *>(QStringLiteral("act_showhw"))) {
-        QSignalBlocker blocker(a);
-        a->setChecked(m_showHandwriting);
-    }
-    if (auto *a = findChild<QAction *>(QStringLiteral("act_showdistort"))) {
-        QSignalBlocker blocker(a);
-        a->setChecked(m_showDistortion);
-    }
+    syncDisplayControls();
 
     m_editor->setEffectsVisible(true);
     m_editor->setEffectOptions(buildRenderOptions());
@@ -1853,18 +2311,36 @@ void MainWindow::applyDistortion()
     m_seed = QRandomGenerator::global()->generate();
     m_wave.reseed(m_seed);
 
-    applyEffectToRanges(ranges, EffectKind::Distortion, true);
+    const EffectApplyResult result = applyEffectToRanges(ranges, EffectKind::Distortion, true);
+
+    /*!
+     * 显示开关按"实际被改了哪种字"来切：
+     *   - 有字的字形被换成扭曲字形 → 开扭曲层；
+     *   - 全都是保留手写、噪声加在笔迹上的 → 开手写层（不然屏幕上看不见变化）。
+     * 两层同时有内容时按"扭曲"显示（手写层照旧画，见 planEffects：
+     * 两种 kind 各自成一项，互不影响）。
+     */
+    if (result.distorted() > 0)
+        showEffectLayer(EffectKind::Distortion);
+    else if (result.noiseOnHandwriting > 0)
+        showEffectLayer(EffectKind::Handwriting);
 
     int affected = 0;
     for (const auto &range : ranges)
         affected += range.second - range.first;
 
-    statusBar()->showMessage(
-        tr("已把平缓噪声波叠加到 %1 个字符的字形路径上（幅度 %2 pt，波数 %3）")
+    QString message =
+        tr("已把平缓噪声波叠加到 %1 个字符上（幅度 %2 pt，波数 %3）")
             .arg(affected)
             .arg(randomAmplitudePt())
-            .arg(waveScale()),
-        10000);
+            .arg(waveScale());
+    if (result.noiseOnHandwriting > 0) {
+        message += result.distorted() > 0
+                       ? tr("；其中 %1 个是手写笔迹（噪声加在笔迹上，不再是原字体）")
+                             .arg(result.noiseOnHandwriting)
+                       : tr("；这些字都是手写笔迹，噪声加在笔迹上（保持手写，没换回原字体）");
+    }
+    statusBar()->showMessage(message, 10000);
     updateStatus();
 }
 
@@ -1878,8 +2354,18 @@ void MainWindow::reseedAndApply()
     const bool hasTarget = cursor.hasSelection() || !m_regexRanges.isEmpty();
 
     if (hasTarget) {
-        applyEffectToRanges(ranges, EffectKind::Distortion, true);
-        statusBar()->showMessage(tr("已换一条噪声波并在选中内容上重新扭曲"), 8000);
+        const EffectApplyResult result = applyEffectToRanges(ranges, EffectKind::Distortion, true);
+        if (result.distorted() > 0)
+            showEffectLayer(EffectKind::Distortion);
+        else if (result.noiseOnHandwriting > 0)
+            showEffectLayer(EffectKind::Handwriting);
+
+        if (result.noiseOnHandwriting > 0 && result.distorted() == 0) {
+            statusBar()->showMessage(
+                tr("已换一条噪声波：选中的字都是手写笔迹，噪声加在笔迹上（手写保留）"), 8000);
+        } else {
+            statusBar()->showMessage(tr("已换一条噪声波并在选中内容上重新扭曲"), 8000);
+        }
     } else {
         statusBar()->showMessage(tr("已换一条噪声波（Ctrl+D 把它叠加到选中文字上）"), 8000);
     }
@@ -1915,7 +2401,18 @@ void MainWindow::clearDistortion()
 
     m_editor->setEffectOptions(buildRenderOptions());
     m_editor->viewport()->update();
-    statusBar()->showMessage(tr("已取消 %1 个字符的笔画扭曲").arg(cleared), 6000);
+    if (cleared > 0) {
+        statusBar()->showMessage(tr("已取消 %1 个字符的笔画扭曲").arg(cleared), 6000);
+    } else {
+        /*!
+         * 一个都没取消时要说清楚为什么：
+         * 手写笔迹本来就在抖（噪声加在笔迹上，见 renderEffects），
+         * 那是「噪声幅度」管的，不是"扭曲"这个效果 —— 否则用户会以为按钮坏了。
+         */
+        statusBar()->showMessage(tr("选中的字里没有扭曲的字形；手写笔迹的抖动归「噪声幅度」管，"
+                                    "调到 0 pt 就没有抖动"),
+                                 8000);
+    }
     updateStatus();
 }
 
@@ -1958,13 +2455,13 @@ EffectRenderOptions MainWindow::buildRenderOptions() const
     options.showDistortion = m_showDistortion;
     options.handwritingReplaceText = opaque;
     options.handwritingColor = opaque ? QColor(0x11, 0x1c, 0x4b) : QColor(0x1d, 0x3f, 0xa8, 210);
+    options.pressureToWidth = m_pressureWidthSpin ? m_pressureWidthSpin->value() : 0.20;
     /*!
      * 扭曲默认"替换正文"，所以颜色直接跟着正文走（黑色），
      * 而不是固定一片蓝 —— 用户看得见的就是最终输出，不会"导出后还留着原字体"。
      */
     options.distortionReplaceText = !m_distortReplaceCheck || m_distortReplaceCheck->isChecked();
     options.distortionColor = QColor(0x1a, 0x1a, 0x1a);
-    options.paperColor = Qt::white;
     return options;
 }
 
@@ -1988,10 +2485,19 @@ void MainWindow::updateStatus()
         if (m_library.characterCount() == 0) {
             m_libraryLabel->setText(tr("尚未载入手写数据。\n用下面的按钮指定 getpattern 导出的 CSV 目录。"));
         } else {
-            m_libraryLabel->setText(tr("已载入 %1 个字符 / %2 份样本（%3 个 CSV 文件）。")
-                                        .arg(m_library.characterCount())
-                                        .arg(m_library.sampleCount())
-                                        .arg(m_library.loadedFiles().size()));
+            QString text = tr("已载入 %1 个字符 / %2 份样本（%3 个 CSV 文件）。")
+                               .arg(m_library.characterCount())
+                               .arg(m_library.sampleCount())
+                               .arg(m_library.loadedFiles().size());
+            // 校正过的字数要露出来：不然"我明明调过基线"会被自己怀疑
+            const int adjusted = m_library.adjustedEntryCount();
+            if (adjusted > 0) {
+                text += QLatin1Char('\n')
+                        + tr("其中 %1 个字符有基线/大小校正（%2 个 xml）。")
+                              .arg(adjusted)
+                              .arg(m_library.adjustedFileCount());
+            }
+            m_libraryLabel->setText(text);
         }
     }
 

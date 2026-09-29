@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
 
@@ -266,21 +267,16 @@ QRectF charRectAt(const QTextDocument *document, int position)
                   qMax(1.0, line.height()));
 }
 
+} // namespace
+
 /*!
  * 一个字符的定位结果：(基线 y, 磅 -> 文档坐标的缩放)。
- * 缩放一律用行内比例，不做任何 DPI 换算 —— 布局坐标和字体度量本来就是同一个体系。
+ * 结构体本身在头文件里（调用方要用它判断"这一格能不能画"）。
  *
  * 注意基线必须和 charRectAt 用同一套原点：**块顶（块在文档里的位置）也要加**。
  * 少了 blockRect.top() 的话第一行碰巧是对的（块顶为 0），
  * 从第二行起笔迹就会整体下移一个行高 —— 这正是"第二行开始错位"的 bug。
  */
-struct BaselineScale
-{
-    double baselineY = 0.0;
-    double scale = 1.0;
-    bool valid = false;
-};
-
 BaselineScale baselineScaleAt(const QTextDocument *document, int position, const QFont &font)
 {
     BaselineScale result;
@@ -307,7 +303,6 @@ BaselineScale baselineScaleAt(const QTextDocument *document, int position, const
     return result;
 }
 
-} // namespace
 
 /*!
  * 把一个字符的字形轮廓用"平滑二维位移场"变形。
@@ -577,6 +572,114 @@ QString formatFontFamily(const QTextCharFormat &format)
 
 // ---------------------------------------------------------------- 手写笔迹
 
+/*!
+ * 按每点的线宽逐段画一条折线（笔压就是逐点变的，一条线一个笔宽画不出来）。
+ *
+ * 做法：把线宽量化成 0.1 单位一档，**同一档的连续点合成一条折线**，
+ * 换档处把上一条收在换档的那个点上、下一条从同一个点起笔 ——
+ * 圆头圆角笔帽会让接缝连成一体，看不出断口。
+ * 不量化的话就是"每两个点画一条线"，一条笔画几百次 drawLine，白费。
+ *
+ * \param widths 与 \a points 等长；某个点为负表示"这个点没有笔压"，用 \a fallbackWidth
+ */
+void drawPressurePolyline(QPainter *painter,
+                          const QVector<QPointF> &points,
+                          const QVector<double> &widths,
+                          const QColor &color,
+                          double fallbackWidth)
+{
+    if (!painter || points.isEmpty())
+        return;
+
+    const int n = points.size();
+    const double fallback = qMax(0.05, fallbackWidth);
+
+    auto widthAt = [&widths, fallback](int i) {
+        const double w = (i >= 0 && i < widths.size()) ? widths.at(i) : -1.0;
+        return w >= 0.0 ? w : fallback;
+    };
+
+    if (n == 1) {
+        const double r = qMax(0.05, widthAt(0)) / 2.0;
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(color);
+        painter->drawEllipse(points.first(), r, r);
+        return;
+    }
+
+    constexpr double kBucket = 0.1; // 线宽量化档距（文档单位）
+    auto bucketOf = [&widthAt](int i) {
+        return int(std::lround(widthAt(i) / kBucket));
+    };
+
+    QPen pen(color);
+    pen.setCapStyle(Qt::RoundCap);
+    pen.setJoinStyle(Qt::RoundJoin);
+    painter->setBrush(Qt::NoBrush);
+
+    auto drawRun = [&](int from, int to, int bucket) {
+        if (to <= from)
+            return;
+        const QVector<QPointF> run = points.mid(from, to - from + 1);
+        pen.setWidthF(qMax(0.05, bucket * kBucket));
+        painter->setPen(pen);
+        painter->drawPolyline(run.constData(), run.size());
+    };
+
+    int start = 0;
+    int bucket = bucketOf(0);
+    for (int i = 1; i < n; ++i) {
+        const int b = bucketOf(i);
+        if (b == bucket)
+            continue;
+        /*!
+         * 换档发生在点 i 上：这一段画到 i-1 为止（用旧档），
+         * 下一段从 i-1 起笔（用新档）—— 两段共点 i-1，接缝不断，
+         * 而且 i 自己的线宽不会被旧档吞掉。
+         */
+        drawRun(start, i - 1, bucket);
+        start = i - 1;
+        bucket = b;
+    }
+    drawRun(start, n - 1, bucket);
+}
+
+QRectF handwritingTargetRect(const QRectF &cell, const HandwritingAdjustment &adjust)
+{
+    // xml 是文本文件，手改出来的离谱值在这里统一钳住，别让它把界面搞崩
+    const double size = qBound(0.05, adjust.size, 10.0);
+    const double shift = qBound(-1.0, adjust.baseline, 1.0);
+
+    const double w = cell.width() * size;
+    const double h = cell.height() * size;
+    const double bottom = cell.bottom() + shift * cell.height();
+
+    /*!
+     * 宽度和高度一起乘 size，但**以格子中线为准**摆回去。
+     *
+     * 高度不乘的话，"宽度受限"的样本（一横、'一' 这种宽而扁的）放不大：
+     * drawHandwritingSample 取的是 min(高比例, 宽比例)，宽那一头没变，整体就不变。
+     * 而普通的"格子中心对齐"写法会随着 size 把字形越推越右，
+     * 所以这里必须自己按中线摆，不能直接用 cell.left() + cell.width()*size。
+     */
+    return QRectF(cell.center().x() - w / 2.0, bottom - h, w, h);
+}
+
+/*!
+ * 把一个手写样本画到 \a target 里。
+ *
+ * 两条规矩：
+ *   1. **等比缩放到完全塞进 target**（宽、高两个方向取更小的那个比例）。
+ *      以前只按高度缩放，pattern 一宽就横向溢出格子：字压到邻居身上，
+ *      靠正文区边缘的那些还会被裁掉（"手写字被砍掉一半"）。
+ *   2. 字形**水平居中、底边压在 target 底边上** —— 调用方给的 target
+ *      底边就是基线，按宽度缩小之后字形会变矮，这时若还按顶边对齐，
+ *      墨迹就会浮到基线上面去。
+ *
+ * \param maxStrokeWidth 笔压 1.0 对应的线宽（文档单位，也就是"字号"）：
+ *        每个点的线宽 = 该点笔压 × maxStrokeWidth，0~1 线性映射。
+ *        传 <= 0 表示没有字号信息，整体回退到"字高的固定比例"。
+ */
 void drawHandwritingSample(QPainter *painter,
                            const HandwritingSample &sample,
                            const QRectF &target,
@@ -584,7 +687,7 @@ void drawHandwritingSample(QPainter *painter,
                            const NoiseWave *wave,
                            double amplitude,
                            double waveScale,
-                           bool anchorLeftTop)
+                           double maxStrokeWidth)
 {
     if (!painter || sample.isEmpty())
         return;
@@ -594,29 +697,34 @@ void drawHandwritingSample(QPainter *painter,
     const double sampleW = box.width();
 
     const double targetH = target.height();
-    if (targetH <= 1e-6)
+    const double targetW = target.width();
+    if (targetH <= 1e-6 || targetW <= 1e-6)
         return;
 
-    // 按高度等比缩放：手写 pattern 保留采集时的宽高比
-    double scale = 1.0;
-    if (sampleH > 1e-6)
-        scale = targetH / sampleH;
-    else if (sampleW > 1e-6)
-        scale = target.width() / sampleW;
+    /*!
+     * 等比缩放：宽、高各自算一个"塞得进去"的比例，取小的那个。
+     * 某一维为 0 的样本（'i' 的点、'一' 这种一笔横）只有另一维有意义，
+     * 那一维给一个"无穷大"的比例，等于不参与比较。
+     */
+    const double infinite = std::numeric_limits<double>::max();
+    const double fitH = sampleH > 1e-6 ? targetH / sampleH : infinite;
+    const double fitW = sampleW > 1e-6 ? targetW / sampleW : infinite;
+    double scale = qMin(fitH, fitW);
+    if (!std::isfinite(scale) || scale <= 0.0)
+        scale = 1.0;
 
-    double originX = target.left();
-    double originY = target.top();
-    if (!anchorLeftTop && sampleW > 1e-6) {
-        const double scaledW = sampleW * scale;
-        if (scaledW < target.width())
-            originX = target.left() + (target.width() - scaledW) / 2.0;
-    }
+    const double glyphW = sampleW * scale;
+    const double glyphH = sampleH * scale;
+    const double originX = target.left() + (targetW - glyphW) / 2.0;
+    const double originY = target.bottom() - glyphH;
 
-    QPen pen(color);
-    pen.setCapStyle(Qt::RoundCap);
-    pen.setJoinStyle(Qt::RoundJoin);
-    // 笔画粗细约等于字高的 7%，并限制在合理范围内
-    pen.setWidthF(qBound(0.6, targetH * 0.07 * qMax(1.0, scale), 5.0));
+    // 没有笔压数据时的兜底线宽：字高的 7%（老行为）
+    const double fallbackWidth = qBound(0.4, targetH * 0.07, 6.0);
+    /*!
+     * 笔压 0 不能真的画成 0 宽：圆头笔帽画不出宽度 0 的线，
+     * 笔画中间会出现断口。给一个相对下限，视觉上仍是一条细线。
+     */
+    const double minWidth = fallbackWidth * 0.35;
 
     painter->save();
     for (const auto &stroke : sample.strokes) {
@@ -624,38 +732,44 @@ void drawHandwritingSample(QPainter *painter,
             continue;
 
         QVector<QPointF> points;
+        QVector<double> widths;
         points.reserve(stroke.size());
-        for (const QPointF &p : stroke)
-            points.append(QPointF(originX + p.x() * scale, originY + p.y() * scale));
+        widths.reserve(stroke.size());
+        for (const HandwritingPoint &p : stroke) {
+            points.append(QPointF(originX + p.pos.x() * scale, originY + p.pos.y() * scale));
+            if (p.pressure < 0.0 || maxStrokeWidth <= 0.0)
+                widths.append(-1.0); // 没有笔压：交给兜底线宽
+            else
+                widths.append(qMax(p.pressure * maxStrokeWidth, minWidth));
+        }
 
         if (wave && wave->isValid() && amplitude > 0.0) {
             points = distortPolyline(points, *wave, amplitude, waveScale, true);
             points = smoothPolyline(points, 1);
         }
 
-        if (points.size() == 1) {
-            painter->setPen(Qt::NoPen);
-            painter->setBrush(color);
-            const double r = pen.widthF() / 2.0;
-            painter->drawEllipse(points.first(), r, r);
-            continue;
-        }
-
-        painter->setPen(pen);
-        painter->setBrush(Qt::NoBrush);
-        painter->drawPolyline(points.constData(), points.size());
+        drawPressurePolyline(painter, points, widths, color, fallbackWidth);
     }
     painter->restore();
 }
 
 // ---------------------------------------------------------------- 主渲染
 
-void renderEffects(QPainter *painter,
-                   const QTextDocument *document,
-                   const EffectRenderOptions &options)
+/*!
+ * 把文档里带效果的字符收集成一份绘制计划。
+ *
+ * 单独抽出来是因为"隐藏原字"也要用同一份信息：绘制正文的那一步必须先知道
+ * 哪些格子会被变形后的字形替换掉（见 EffectDrawItem 的注释）。
+ * 两边各走一遍文档遍历的话，迟早会不一致 —— 一处改了、另一处忘了。
+ */
+QVector<EffectDrawItem> planEffects(const QTextDocument *document,
+                                    const EffectRenderOptions &options,
+                                    QVector<QPair<int, int>> *hiddenRanges)
 {
-    if (!painter || !document || !options.anyLayer())
-        return;
+    QVector<EffectDrawItem> items;
+    if (!document || !options.anyLayer())
+        return items;
+
     for (QTextBlock block = document->begin(); block.isValid(); block = block.next()) {
         for (QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it) {
             const QTextFragment fragment = it.fragment();
@@ -675,112 +789,180 @@ void renderEffects(QPainter *painter,
                     || ch == QChar::LineSeparator)
                     continue;
 
-                const QString one(ch);
                 const int pos = basePos + i;
-
                 const QRectF charRect = charRectAt(document, pos);
                 if (!charRect.isValid() || charRect.height() <= 1.0)
                     continue;
 
-                const QFont font = effectiveFont(document, block, fmt);
-                const BaselineScale fit = baselineScaleAt(document, pos, font);
-                const QFontMetricsF fm(font);
-                const quint32 seed = mixSeed(style.seed, quint32(ch.unicode()));
+                EffectDrawItem item;
+                item.position = pos;
+                item.charRect = charRect;
+                item.font = effectiveFont(document, block, fmt);
+                item.fit = baselineScaleAt(document, pos, item.font);
+                item.seed = mixSeed(style.seed, quint32(ch.unicode()));
+                item.style = style;
+                item.foreground = fmt.foreground().color();
+                item.hasForeground = (fmt.foreground().style() != Qt::NoBrush)
+                                     && item.foreground.isValid();
 
-                // ---- 手写层 ----
-                if (options.showHandwriting && style.kind == EffectKind::Handwriting) {
-                    if (!options.library || !options.library->contains(one)) {
-                        options.missing.insert(one);
-                    } else {
-                        const HandwritingSample *sample = options.library->pick(one, seed);
-                        if (!sample) {
-                            options.missing.insert(one);
-                        } else if (fit.valid) {
-                            /*!
-                             * 手写 pattern 的包围盒正好填满字身的 ascent..descent，
-                             * 所以按"行内比例"缩放、把它的下边缘压在基线上就能对齐正文。
-                             * 缩放用的是 fit.scale（行高 / 自然字高），
-                             * 和扭曲层同一个口径 —— 换字号、改行距时两层不会各走各的。
-                             */
-                            const double targetH = (fm.ascent() + fm.descent()) * fit.scale;
-                            const QRectF target(charRect.left(), fit.baselineY - targetH,
-                                                charRect.width(), targetH);
+                /*!
+                 * 只有"会把这一格整格替换掉"的层才需要隐藏原字：
+                 *   - 扭曲层开启替换模式时，字形轮廓已经完全顶替原字；
+                 *   - 手写层开启"笔迹盖住正文"时同理。
+                 * 叠加模式（distortionReplaceText = false）是故意让原字露出来的，
+                 * 那种情况下一格都不能隐藏。
+                 *
+                 * 注意必须在 items.append() **之前**写进 item：
+                 * 追加的是副本，之后再改局部变量就写不进去了（踩过）。
+                 */
+                const bool replaced =
+                    (options.showDistortion && style.kind == EffectKind::Distortion
+                     && options.distortionReplaceText && item.fit.valid && options.wave
+                     && options.wave->isValid())
+                    || (options.showHandwriting && style.kind == EffectKind::Handwriting
+                        && options.handwritingReplaceText);
+                item.hidden = replaced;
+                items.append(item);
 
-                            NoiseWave localWave;
-                            const NoiseWave *wave = nullptr;
-                            double amplitude = 0.0;
-                            if (options.wave && options.amplitudePt > 0.0) {
-                                localWave.reseed(mixSeed(seed, 0x5F356495u));
-                                wave = &localWave;
-                                amplitude = options.amplitudePt * fit.scale * 0.6;
-                            }
-                            drawHandwritingSample(painter, *sample, target,
-                                                  options.handwritingColor,
-                                                  wave, amplitude, options.waveScale,
-                                                  options.handwritingReplaceText);
-                        }
-                    }
-                }
+                if (replaced && hiddenRanges)
+                    hiddenRanges->append(qMakePair(pos, 1));
+            }
+        }
+    }
 
-                // ---- 扭曲层 ----
-                if (options.showDistortion && style.kind == EffectKind::Distortion
-                    && options.wave && options.wave->isValid() && fit.valid) {
-                    // 幅度按行高缩放：换字号之后"抖多少"看起来是一样的。
-                    // 真正的上限由 deformGlyph 按字形的最小特征尺寸再钳一次
-                    // （钳不住就会自交，字形会碎）。
-                    const double amplitude = qMax(0.05, options.amplitudePt * fit.scale);
+    // 相邻的位置合并成区间，调用方可以一次设一大段格式
+    if (hiddenRanges) {
+        std::sort(hiddenRanges->begin(), hiddenRanges->end());
+        QVector<QPair<int, int>> merged;
+        for (const QPair<int, int> &r : *hiddenRanges) {
+            if (!merged.isEmpty() && merged.last().first + merged.last().second == r.first)
+                merged.last().second += r.second;
+            else
+                merged.append(r);
+        }
+        *hiddenRanges = merged;
+    }
+    return items;
+}
 
-                    const QVector<QVector<QPointF>> outlines =
-                        distortedGlyphOutlines(one, font, *options.wave, seed, fit.scale,
-                                               amplitude, options.waveScale);
-                    if (outlines.isEmpty())
-                        continue;
+void renderEffects(QPainter *painter,
+                   const QTextDocument *document,
+                   const EffectRenderOptions &options)
+{
+    if (!painter || !document || !options.anyLayer())
+        return;
+    const QVector<EffectDrawItem> items = planEffects(document, options);
+    for (const EffectDrawItem &item : items) {
+        const QChar ch = document->characterAt(item.position);
+        const QString one(ch);
+        const QRectF &charRect = item.charRect;
+        const BaselineScale &fit = item.fit;
+        const QFont &font = item.font;
+        const EffectStyle &style = item.style;
+        const quint32 seed = item.seed;
+        const QFontMetricsF fm(font);
 
-                    // 颜色：优先用字符自己的前景色（富文本颜色），没设过才用默认色
-                    QColor fill = fmt.foreground().color();
-                    if (!fmt.foreground().style() || !fill.isValid())
-                        fill = options.distortionColor;
+        // ---- 手写层 ----
+        if (options.showHandwriting && style.kind == EffectKind::Handwriting) {
+            if (!options.library || !options.library->contains(one)) {
+                options.missing.insert(one);
+            } else {
+                const HandwritingSample *sample = options.library->pick(one, seed);
+                if (!sample) {
+                    options.missing.insert(one);
+                } else if (fit.valid) {
                     /*!
-                     * 替换模式：先把这一格刷成纸色，原字就看不见了 ——
-                     * "导出后还留着原字体"的问题就此消失，屏幕上什么样纸上就什么样。
-                     * 叠加模式则把扭曲层降一点透明度，方便对照"改了哪些笔画"。
-                     */
-                    if (!options.distortionReplaceText && fill.alpha() == 255)
-                        fill.setAlpha(205);
-
-                    painter->save();
-                    /*!
-                     * 定位铁律（扭曲层）：字形轮廓已经是"基线在原点、y 向下"，
-                     * 所以绘制原点就是**基线**，一项都不用再加。
-                     * 墨迹自然落在 [基线 - ascent, 基线 + descent]，
-                     * 正好是行框里 ascent..descent 那一段 —— 和正文完全重合。
+                     * 手写 pattern 的包围盒正好填满字身的 ascent..descent，
+                     * 所以按"行内比例"缩放、把它的下边缘压在基线上就能对齐正文。
+                     * 缩放用的是 fit.scale（行高 / 自然字高），
+                     * 和扭曲层同一个口径 —— 换字号、改行距时两层不会各走各的。
+                     * 横向再按格子宽度夹一次（见 drawHandwritingSample）。
                      *
-                     * 以前这里又加过 ascent、又加过 descent，还配了一个实测的魔法常量
-                     * kLineTopCalibration，全是绕着"轮廓被翻了 y 又没翻回来"打的补丁。
+                     * 这一格最终落在哪儿由 handwritingTargetRect 决定：
+                     * 用户在校正对话框里给每个字调过的基线/大小就在那里生效，
+                     * 没调过时它原样返回（逐像素等价于老行为）。
                      */
-                    painter->translate(charRect.left(), fit.baselineY);
-                    // 裁剪防溢：扭曲后的笔画不许爬进旁边的字
-                    painter->setClipRect(QRectF(-1.0, -charRect.height(),
-                                                charRect.width() + 2.0,
-                                                charRect.height() * 3.0));
+                    const double targetH = (fm.ascent() + fm.descent()) * fit.scale;
+                    const QRectF cell(charRect.left(), fit.baselineY - targetH,
+                                      charRect.width(), targetH);
+                    const QRectF target =
+                        handwritingTargetRect(cell, options.library->adjustment(*sample));
 
-                    if (options.distortionReplaceText) {
-                        // 先把这一格刷成纸色：原字被盖掉，剩下的就是扭曲后的笔画
-                        const double padY = fm.ascent() * 0.2;
-                        painter->setPen(Qt::NoPen);
-                        painter->setBrush(options.paperColor);
-                        painter->drawRect(QRectF(0.0, -fm.ascent() - padY, charRect.width(),
-                                                 fm.ascent() + fm.descent() + padY * 2.0));
+                    NoiseWave localWave;
+                    const NoiseWave *wave = nullptr;
+                    double amplitude = 0.0;
+                    if (options.wave && options.amplitudePt > 0.0) {
+                        localWave.reseed(mixSeed(seed, 0x5F356495u));
+                        wave = &localWave;
+                        amplitude = options.amplitudePt * fit.scale * 0.6;
                     }
-
-                    painter->setPen(Qt::NoPen);
-                    painter->setBrush(fill);
-                    // 用整字拼一个填充路径：外形和"洞"一起交给奇偶规则，
-                    // 逐条 drawPolygon 填不出洞（详见 buildGlyphPath 的注释）
-                    painter->drawPath(buildGlyphPath(outlines));
-                    painter->restore();
+                    /*!
+                     * 笔压映射：线宽 = 笔压 × 字号 × pressureToWidth。
+                     * 字号取"磅 -> 文档单位"换算后的 em（fit.scale 就是那个换算）。
+                     */
+                    const double emDoc = qMax(1.0, font.pointSizeF()) * fit.scale;
+                    const double maxStrokeWidth = emDoc * qMax(0.0, options.pressureToWidth);
+                    drawHandwritingSample(painter, *sample, target,
+                                          options.handwritingColor,
+                                          wave, amplitude, options.waveScale,
+                                          maxStrokeWidth);
                 }
             }
+        }
+
+        // ---- 扭曲层 ----
+        if (options.showDistortion && style.kind == EffectKind::Distortion
+            && options.wave && options.wave->isValid() && fit.valid) {
+            // 幅度按行高缩放：换字号之后"抖多少"看起来是一样的。
+            // 真正的上限由 deformGlyph 按字形的最小特征尺寸再钳一次
+            // （钳不住就会自交，字形会碎）。
+            const double amplitude = qMax(0.05, options.amplitudePt * fit.scale);
+
+            const QVector<QVector<QPointF>> outlines =
+                distortedGlyphOutlines(one, font, *options.wave, seed, fit.scale,
+                                       amplitude, options.waveScale);
+            if (outlines.isEmpty())
+                continue;
+
+            // 颜色：优先用字符自己的前景色（富文本颜色），没设过才用默认色
+            QColor fill = item.hasForeground ? item.foreground : options.distortionColor;
+            if (!fill.isValid())
+                fill = options.distortionColor;
+            /*!
+             * 替换模式：**原字根本不会被画出来**（绘制正文那一步把这一格的前景
+             * 设成了透明，见 planEffects / EffectDrawItem 的注释），
+             * 所以这里绝对不能再刷一块纸色当底 ——
+             * 那块底色是盖在选区高亮之上的，会把选框啃掉一圈，
+             * 用户看到的就是"变形后的字有个白底，挡住选框，只留 1 像素蓝边"。
+             *
+             * 叠加模式则把扭曲层降一点透明度，方便对照"改了哪些笔画"。
+             */
+            if (!options.distortionReplaceText && fill.alpha() == 255)
+                fill.setAlpha(205);
+
+            painter->save();
+            /*!
+             * 定位铁律（扭曲层）：字形轮廓已经是"基线在原点、y 向下"，
+             * 所以绘制原点就是**基线**，一项都不用再加。
+             * 墨迹自然落在 [基线 - ascent, 基线 + descent]，
+             * 正好是行框里 ascent..descent 那一段 —— 和正文完全重合。
+             *
+             * 以前这里又加过 ascent、又加过 descent，还配了一个实测的魔法常量
+             * kLineTopCalibration，全是绕着"轮廓被翻了 y 又没翻回来"打的补丁。
+             */
+            painter->translate(charRect.left(), fit.baselineY);
+            // 裁剪防溢：扭曲后的笔画不许爬进旁边的字
+            painter->setClipRect(QRectF(-1.0, -charRect.height(),
+                                        charRect.width() + 2.0,
+                                        charRect.height() * 3.0));
+
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(fill);
+            // 用整字拼一个填充路径：外形和"洞"一起交给奇偶规则，
+            // 逐条 drawPolygon 填不出洞（详见 buildGlyphPath 的注释）
+            const QPainterPath gp = buildGlyphPath(outlines);
+            painter->drawPath(gp);
+            painter->restore();
         }
     }
 }

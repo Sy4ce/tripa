@@ -54,6 +54,17 @@ bool hasEffect(const QTextCharFormat &format)
     return effectStyle(format).isValid();
 }
 
+EffectKind distortionEffectKind(const QTextCharFormat &format)
+{
+    /*!
+     * 只认"这个字现在正用手写"这一件事，不看手写库里有没有数据 ——
+     * 按库判断的话，给一段普通文字套扭曲会突然把字变成手写体，
+     * 那是另一件事，用户没要求。
+     */
+    return effectStyle(format).kind == EffectKind::Handwriting ? EffectKind::Handwriting
+                                                               : EffectKind::Distortion;
+}
+
 void clearEffects(QTextDocument *document)
 {
     if (!document)

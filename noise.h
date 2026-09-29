@@ -29,12 +29,25 @@ public:
     bool isValid() const { return !m_terms.isEmpty(); }
     int termCount() const { return m_terms.size(); }
 
-private:
     struct Term {
         double amplitude;
         double frequency;
         double phase;
     };
+
+    //! 当前波形的全部分量（保存文件用：存下来就能把同一条波形读回去）
+    const QVector<Term> &terms() const { return m_terms; }
+    /*!
+     * 直接用给定的分量建一条波形（读文件用）。
+     *
+     * 归一化系数 m_norm 必须一起给：它等于"各分量 amplitude 之和"，
+     * 少了它波形就不是归一化的 —— 同一个 seed 存进去、读出来幅度就变了，
+     * 所以 setTerms 不改这条不变量，只做校验（数值必须是有限正数）。
+     * 数据不合法时返回 false，波形保持不变（调用方可以退回 reseed(seed)）。
+     */
+    bool setTerms(const QVector<Term> &terms, double norm);
+
+private:
     QVector<Term> m_terms;
     double m_norm = 1.0; //!< 幅值之和，用于归一化
 };

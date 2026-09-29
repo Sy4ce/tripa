@@ -3,6 +3,8 @@
 #include <QRandomGenerator>
 #include <QtMath>
 
+#include <cmath>
+
 NoiseWave::NoiseWave() = default;
 
 void NoiseWave::reseed(quint32 seed)
@@ -46,6 +48,26 @@ double NoiseWave::value(double t) const
         sum += term.amplitude * std::sin(2.0 * M_PI * term.frequency * t + term.phase);
 
     return sum / m_norm;
+}
+
+bool NoiseWave::setTerms(const QVector<Term> &terms, double norm)
+{
+    // 波形是手改得动的文本文件里读出来的：坏数据一律拒收，退回默认波形
+    if (terms.isEmpty() || !std::isfinite(norm) || norm <= 0.0)
+        return false;
+
+    for (const Term &term : terms) {
+        if (!std::isfinite(term.amplitude) || term.amplitude <= 0.0)
+            return false;
+        if (!std::isfinite(term.frequency) || term.frequency <= 0.0)
+            return false;
+        if (!std::isfinite(term.phase))
+            return false;
+    }
+
+    m_terms = terms;
+    m_norm = norm;
+    return true;
 }
 
 QVector<QPointF> resamplePolyline(const QVector<QPointF> &points, double step)

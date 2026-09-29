@@ -19,8 +19,13 @@ class HandwritingProofSheet : public QDialog
 {
     Q_OBJECT
 public:
+    /*!
+     * \param pressureToWidth 笔压 -> 线宽系数（和正文渲染同一个口径），
+     *        预览图上的粗细比例要和纸上看到的一致，否则校对表会误导人。
+     */
     HandwritingProofSheet(const HandwritingLibrary *library,
                           const QStringList &missingChars = {},
+                          double pressureToWidth = 0.20,
                           QWidget *parent = nullptr);
 
 private:
@@ -30,6 +35,7 @@ private:
     QTableWidget *m_table = nullptr;
     QLabel *m_summaryLabel = nullptr;
     QPushButton *m_reloadButton = nullptr;
+    double m_pressureToWidth = 0.20;
 
 signals:
     //! 用户点了"重新载入手写数据"

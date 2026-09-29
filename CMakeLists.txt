@@ -24,8 +24,6 @@ set(PROJECT_SOURCES
         mainwindow.h
         texteditor.cpp
         texteditor.h
-        effectsoverlay.cpp
-        effectsoverlay.h
         effectsrenderer.cpp
         effectsrenderer.h
         handwriting.cpp
@@ -42,6 +40,10 @@ set(PROJECT_SOURCES
         fontspool.h
         proofsheet.cpp
         proofsheet.h
+        baselineadjust.cpp
+        baselineadjust.h
+        tripadocument.cpp
+        tripadocument.h
         resources.qrc
 )
 
@@ -115,4 +117,23 @@ target_include_directories(test_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_core PRIVATE Qt${QT_VERSION_MAJOR}::Gui)
 if(MSVC)
     target_compile_options(test_core PRIVATE /utf-8)
+endif()
+
+# ---------------------------------------------------------------- 文档格式自检
+# .tripa 的存/读往返：正文、逐字格式、段落格式、效果区间、页面设置、噪声波。
+# 跑法: cmake --build build --target test_document && ./build/test_document.exe
+add_executable(test_document
+    tests/test_document.cpp
+    tripadocument.cpp
+    handwriting.cpp
+    noise.cpp
+    effect.cpp
+)
+target_include_directories(test_document PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_document PRIVATE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Gui
+)
+if(MSVC)
+    target_compile_options(test_document PRIVATE /utf-8)
 endif()
