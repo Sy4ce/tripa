@@ -64,6 +64,13 @@ void tripaRenderToDevice(QTextDocument *document,
     const QSizeF cardPx = setup.bodySizePx();
 
     document->setDocumentMargin(0);
+    /*!
+     * 分页高度 = **正文区高度**（不是纸高），因为这一路的排版原点和屏幕那条路
+     * 不一样：屏幕上每张纸的正文区是隔一个**纸高**放的，而这里是把
+     * "第 n 页的正文区"直接摞起来（见下面 `-page * cardPx.height()`）。
+     * 两套排法各自自洽就行 —— 但对齐的**结果**必须一样：每页一份内容、
+     * 四边页边距都留白。
+     */
     document->setPageSize(cardPx);
 
     // 设备像素 / 96dpi 像素（96dpi 下 1mm = 25.4 px）
@@ -87,24 +94,23 @@ void tripaRenderToDevice(QTextDocument *document,
      *   导出 PDF 时原字又冒出来了，所见非所得。）
      */
     const QVector<EffectDrawItem> items = planEffects(document, options);
+
     /*!
      * 正文窗口（文档坐标下的第一页正文区）减去那些洞。
      *
-     * 奇偶填充：窗口是实、洞是空。洞必须挑**落在窗口里**的那些 ——
-     * 别的页的洞在原坐标里和窗口不相交，直接加进奇偶路径会变成一块
-     * "实心岛"，平白多给出一片可绘制区域。
+     * 奇偶填充：窗口是实、洞是空 —— **两层**，别把"减完洞的窗口"
+     * 再当成一个 rect 加回去（那样窗口和洞会互相抵消，整页都画不出来）。
+     * 洞必须挑**落在窗口里**的那些：别的页的洞在原坐标里和窗口不相交，
+     * 直接加进奇偶路径会变成一块"实心岛"，平白多给出一片可绘制区域。
      */
-    QPainterPath pageClip;
-    bool anyHidden = false;
+    QPainterPath windowPath;
     {
         const QRectF window(QPointF(0.0, 0.0), cardPx);
-        pageClip.setFillRule(Qt::OddEvenFill);
-        pageClip.addRect(window);
+        windowPath.setFillRule(Qt::OddEvenFill);
+        windowPath.addRect(window);
         for (const EffectDrawItem &item : items) {
-            if (item.hidden && item.charRect.intersects(window)) {
-                pageClip.addRect(item.charRect);
-                anyHidden = true;
-            }
+            if (item.hidden && item.charRect.intersects(window))
+                windowPath.addRect(item.charRect);
         }
     }
 
@@ -123,11 +129,16 @@ void tripaRenderToDevice(QTextDocument *document,
         QAbstractTextDocumentLayout::PaintContext context;
         context.palette.setColor(QPalette::Text, Qt::black);
         /*!
-         * 有字要被替换时才设这个裁剪（它同时充当"这一页的正文窗口"）；
-         * 一个洞都没有时保持原样不设裁剪，免得平白改变无效果文档的输出。
+         * "这一页的正文窗口"必须**总是**设上：
+         *
+         * 这里的分页高度取的是正文区高度，页与页的正文区在文档坐标里是
+         * **紧挨着**排的（`-page * 正文高`），不留纸高那段空档 ——
+         * 所以上一页最后一行的下伸部、以及"上下边距"的留白，都只能靠这个
+         * 裁剪窗口挡住。不设的话页与页之间会互相看到对方的字
+         * （屏幕上那条路本来就是每页 `setClipRect(正文区)`，两边要对齐）。
+         * 这一条路径同时也是"挖洞"（被效果整格替换的格子不画原字）。
          */
-        if (anyHidden)
-            painter->setClipPath(pageClip, Qt::IntersectClip);
+        painter->setClipPath(windowPath, Qt::IntersectClip);
         document->documentLayout()->draw(painter, context);
 
         if (options.anyLayer()) {
@@ -998,36 +1009,68 @@ static int runZoomProbe(MainWindow &window, const QString &outDir)
         QTextCursor caretCursor(editor->document());
         caretCursor.setPosition(block.position());
         editor->setTextCursor(caretCursor);
-        editor->setFocus();
+        /*!
+         * 光标只在**有焦点**时画（见 TextEditor::drawCaret）。无头自检里
+         * 窗口不一定被激活，所以这里既 `setFocus()` 又直接给 viewport 焦点，
+         * 保证量到的不是"因为没焦点所以没画"。
+         */
+        editor->setFocus(Qt::OtherFocusReason);
+        editor->viewport()->setFocus(Qt::OtherFocusReason);
+        /*!
+         * 再把闪烁关掉：`cursorFlashTime() == 0` 时 Qt 的光标一直可见。
+         * 不关的话"抓 60 次总有一次在亮相位"是靠运气的 ——
+         * 实测同一份二进制跑三次会失败一次（每次 grab 都在同一个相位上，
+         * 撞上暗相位就永远找不到那根竖条）。
+         */
+        QApplication::setCursorFlashTime(0);
         editor->verticalScrollBar()->setValue(200);
         for (int i = 0; i < 20; ++i) {
             QApplication::processEvents();
             QThread::msleep(5);
         }
+        QTextStream(stdout) << "zoom: [光标量测] 焦点 editor=" << editor->hasFocus()
+                            << " viewport=" << editor->viewport()->hasFocus() << "\n";
 
+        /*!
+         * 量测一律在 **viewport 自己的那张图**里做：
+         * `window.grab()` 会拿到子控件的旧后备存储（实测滚动之后纸是新的、
+         * 纸上的字和光标还是滚动之前那一帧），而 viewport 的图没有这个问题，
+         * 光标、正文、纸面本来就都画在里面。
+         */
         const double dpr = window.devicePixelRatioF();
-        const QPoint vpInWindow = editor->viewport()->mapTo(&window, QPoint(0, 0));
         const QPointF docOrigin = editor->documentOriginInViewport();
         const double docY = editor->document()->documentLayout()->blockBoundingRect(block).top();
-        const double wantTop = vpInWindow.y() + docOrigin.y() + docY;
-        const double wantLeft = vpInWindow.x() + docOrigin.x();
+        const double wantTop = docOrigin.y() + docY; // viewport 局部坐标
+        const double wantLeft = docOrigin.x();
+        QTextStream(stdout) << "zoom: [光标量测] 正文原点 y=" << docOrigin.y()
+                            << " 第 20 段文档 y=" << docY << " 预期(view 局部) y=" << wantTop
+                            << " 滚动=" << editor->verticalScrollBar()->value() << "/"
+                            << editor->verticalScrollBar()->maximum() << " 视口高="
+                            << editor->viewport()->height() << "\n";
 
         int foundTop = -1;
         int foundLeft = -1;
         int foundBottom = -1;
-        for (int attempt = 0; attempt < 40 && foundTop < 0; ++attempt) {
+        for (int attempt = 0; attempt < 60 && foundTop < 0; ++attempt) {
             QApplication::processEvents();
-            QThread::msleep(20); // 光标会闪：暗相位抓不到，多抓几次
-            const QImage win = window.grab().toImage();
+            QThread::msleep(25); // 光标会闪：暗相位抓不到，多抓几次
+            /*!
+             * 每次抓之前**强制一次同步重绘**：`viewport()->grab()` 拿的是
+             * 后备存储里的内容，光 `processEvents()` 不保证绘制已经发生 ——
+             * 不强制的话可能反复抓到同一帧（正好是暗相位就永远找不到光标）。
+             */
+            editor->viewport()->repaint();
+            QApplication::processEvents();
+            const QImage shot = editor->viewport()->grab().toImage();
             const int y0 = qMax(0, int((wantTop - 8) * dpr));
-            const int y1 = qMin(win.height(), int((wantTop + 40) * dpr));
+            const int y1 = qMin(shot.height(), int((wantTop + 40) * dpr));
             const int x0 = qMax(0, int(wantLeft * dpr));
-            const int x1 = qMin(win.width(), int((wantLeft + 60) * dpr));
+            const int x1 = qMin(shot.width(), int((wantLeft + 60) * dpr));
             for (int x = x0; x < x1 && foundTop < 0; ++x) {
                 int top = -1;
                 int bottom = -1;
                 for (int y = y0; y < y1; ++y) {
-                    const QRgb px = win.pixel(x, y);
+                    const QRgb px = shot.pixel(x, y);
                     if (qRed(px) < 90 && qGreen(px) < 90 && qBlue(px) < 90) {
                         if (top < 0)
                             top = y;
@@ -1382,6 +1425,374 @@ static int runHandwritingNoiseProbe(MainWindow &window, const QString &outDir)
 }
 
 /*!
+ * \brief 分页自检：写满字的文档必须**一页一份内容**，页边距四边都管用。
+ *
+ * 这一组是照着两个真实缺陷写的：
+ *   1. 正文排到第一页正文区以下之后，屏幕上会把同一份内容在第 2、3…页
+ *      再来一遍（外加一个不知名的蓝色虚线框），而且"写满了字就一定要崩"；
+ *   2. 四边页边距里只有左右和第一页的上边距"看起来有效"，
+ *      下边距从来没被任何东西挡住过。
+ *
+ * 量法一律**看屏幕像素**，不看算出来的数：
+ *   - 每张纸上最上面和最下面那点墨的位置，必须落在正文区里（四边页边距都留白）；
+ *   - 缩放到 100% / 25% / 400% 来回折腾不许崩（Qt 的断言失败是直接 abort）。
+ */
+static int runPageLayoutProbe(MainWindow &window, const QString &outDir)
+{
+    TextEditor *editor = window.findChild<TextEditor *>();
+    if (!editor) {
+        QTextStream(stderr) << "pagefix 失败：找不到编辑区\n";
+        return 60;
+    }
+
+    /*!
+     * 正文写成**带序号的短段落**：一行一段，行数给足一页装不下
+     * （A4 正文区大约 38 行），这样第 2 页一定该有内容。
+     *
+     * 光标必须留在**文档开头**：光标竖条本身也是"墨"，而 `setPlainText()`
+     * 会把光标留在文档末尾 —— 那根竖条会跑到页边距外面去，
+     * 量出来的"最后一点墨"就是它，白报一个"越界"。
+     */
+    const int totalLines = 120;
+    {
+        QStringList lines;
+        lines.reserve(totalLines);
+        for (int i = 0; i < totalLines; ++i)
+            lines << QStringLiteral("管%1").arg(i + 1);
+        editor->setCurrentCharFormat(QTextCharFormat());
+        editor->setPlainText(lines.join(QLatin1Char('\n')));
+    }
+    editor->moveCursor(QTextCursor::Start);
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(3);
+    }
+    QTextStream(stdout) << "pagefix: 光标位置=" << editor->textCursor().position() << "\n";
+
+    /**
+     * 改动编辑区状态之后，必须**强制一次同步重绘**再截图。
+     *
+     * `QApplication::processEvents()` 只保证事件被派发，绘制有可能是异步的；
+     * `QWidget::grab()` 拿的是控件当前后备存储里的内容 —— 于是抓到的还是
+     * "上一次重绘"那一帧。自检里踩过这个坑：滚动之后截的图其实还是滚动之前那一帧，
+     * 白查了半天"正文没跟着纸走"。
+     */
+    auto settle = [&] {
+        for (int i = 0; i < 10; ++i) {
+            QApplication::processEvents();
+            QThread::msleep(3);
+        }
+        editor->viewport()->repaint();
+        QApplication::processEvents();
+    };
+    auto grabViewport = [&] { return editor->viewport()->grab().toImage(); };
+
+    /*!
+     * 量"每页各画了什么"最省事的办法：**把比例尺调到 40%**。
+     *
+     * 0.4 倍时整张 A4 纸只有 449 视图像素高，而编辑区有 792 高 ——
+     * 第 1、2 页（甚至第 3 页的一截）**一次性都在画面上**，
+     * 一张截图就能把好几页摆在一起比，不用滚动、不用换帧、不怕抓到旧帧。
+     * 0.4 也正是用户报告问题时用的比例尺。
+     */
+    const double measureZoom = 0.4;
+    editor->setZoom(measureZoom);
+    editor->verticalScrollBar()->setValue(0);
+    settle();
+
+    const double dpr = window.devicePixelRatioF();
+    const double paperH = editor->paperViewHeightPx(); // 视图像素口径
+    const double paperW = editor->paperViewWidthPx();
+    const double bodyTop = editor->bodyOriginPx().y() * editor->zoom();
+    const double bodyBottom = bodyTop + editor->pageSetup().bodySizePx().height() * editor->zoom();
+
+    /*!
+     * 一张纸的量测结果。坐标一律是"**相对这张纸的左上角**"的视图像素，
+     * 纸面、正文都在 viewport 里，所以量的是 viewport 自己的那张图。
+     */
+    struct PageMeasure
+    {
+        double paperTop = 0.0;  //!< 这张纸的顶在 viewport 里的 y
+        double firstInk = -1.0; //!< 最上面那点墨相对纸顶的距离
+        double lastInk = -1.0;
+        int bands = 0;          //!< 墨带条数 ≈ 这一页装了几行
+        bool measurable = false;
+        bool fullyVisible = false;
+    };
+
+    /*!
+     * 扫描窗口取 **纸面 ∩ viewport**，不能只按纸面算 ——
+     * 纸有一部分在视口外面时，那一段在截图里其实是**桌面**（深灰），
+     * 会被当成墨（踩过：于是"那张纸通篇是墨"）。
+     * 横向再往里缩 8 像素避开纸张那圈 1px 的灰边。
+     */
+    auto measurePage = [&](const QImage &shot, int page, double paperHNow) {
+        PageMeasure m;
+        const QPointF origin = editor->paperOriginInViewport();
+        m.paperTop = origin.y() + page * paperHNow;
+        const double paperX = origin.x();
+        const double viewW = shot.width() / dpr;
+        const double viewH = shot.height() / dpr;
+
+        const double loX = qMax(paperX + 8.0, 0.0);
+        const double hiX = qMin(paperX + paperW - 8.0, viewW);
+        const double loY = qMax(m.paperTop + 4.0, 0.0);
+        const double hiY = qMin(m.paperTop + paperHNow - 4.0, viewH);
+        /*!
+         * 露出来不足 2 像素的纸不量：那点宽度里连纸张边框都算进去了，
+         * 量出来的"墨"其实是边框；而且它也不该被当成"看得见的那一页"。
+         */
+        if (hiX - loX < 8.0 || hiY - loY < 2.0)
+            return m;
+        m.measurable = true;
+        m.fullyVisible = m.paperTop >= 0.0 && m.paperTop + paperHNow <= viewH;
+
+        const int x0 = int(std::lround(loX * dpr));
+        const int x1 = qMin(shot.width() - 1, int(std::lround(hiX * dpr)));
+        const int y0 = int(std::lround(loY * dpr));
+        const int y1 = qMin(shot.height() - 1, int(std::lround(hiY * dpr)));
+        bool inBand = false;
+        for (int y = y0; y <= y1; ++y) {
+            bool ink = false;
+            for (int x = x0; x <= x1 && !ink; ++x) {
+                const QRgb c = shot.pixel(x, y);
+                if (qRed(c) < 200 || qGreen(c) < 200 || qBlue(c) < 200)
+                    ink = true;
+            }
+            if (ink) {
+                const double rel = y / dpr - m.paperTop;
+                if (m.firstInk < 0.0)
+                    m.firstInk = rel;
+                m.lastInk = rel;
+                if (!inBand) {
+                    ++m.bands;
+                    inBand = true;
+                }
+            } else {
+                inBand = false;
+            }
+        }
+        return m;
+    };
+
+    /*!
+     * 四边页边距一律按**正文区**判：每张纸上那点墨都必须落在
+     * [bodyTop, bodyBottom] 里。容差 2 像素（墨不一定顶到格子边）。
+     *
+     * 正文区范围**当场按当前比例尺算**：40% 时正文区只有 389 高、100% 时有 971 高，
+     * 拿一个缩放比例算出来的数去判另一个比例尺的量测，会报出假的"越界"。
+     *
+     * 以前只有第 1 页的上边距和左右边距成立：正文是从纸顶开始连续画的，
+     * 每页的切片还整体少挪了一个下边距 —— 于是第 2 页起"顶到纸边、越进下边距"。
+     */
+    auto checkMargins = [&](int page, const PageMeasure &m, const char *where) {
+        if (!m.measurable || m.firstInk < 0.0)
+            return 0;
+        const double top = editor->bodyOriginPx().y() * editor->zoom();
+        const double bottom = top + editor->pageSetup().bodySizePx().height() * editor->zoom();
+        /*!
+         * 容差放宽到 6 像素：只露出来一小截的纸，扫描窗口的上边界
+         * 本身就是"视口顶"，墨和它相减会有几个像素的出入。
+         */
+        if (m.firstInk < top - 6.0) {
+            QTextStream(stderr) << "pagefix 失败（" << where << "）：第 " << page + 1
+                                << " 页的墨跑进了上边距（" << m.firstInk << " < " << top << "）\n";
+            return 61;
+        }
+        if (m.lastInk > bottom + 6.0) {
+            QTextStream(stderr) << "pagefix 失败（" << where << "）：第 " << page + 1
+                                << " 页的墨越过了下边距（" << m.lastInk << " > " << bottom << "）\n";
+            return 62;
+        }
+        return 0;
+    };
+
+    /*!
+     * 一、40% 下第 1、2 页必须**各有各的内容**。
+     *
+     * 判据用"墨带的条数 + 首末墨的位置"：一页装满的行数是个定值，
+     * 第 2 页也装满 → 两页的行数应当差不多、而**墨的位置必须错开**；
+     * 老代码里第 2 页画的是"文档开头"，两页的墨会**完全重合**。
+     */
+    {
+        const QImage shot = grabViewport();
+        shot.save(outDir + QStringLiteral("/uitest_pagefix_zoom40.png"));
+
+        int measured = 0;
+        int bands[3] = {0, 0, 0};
+        double firstInk[3] = {-1.0, -1.0, -1.0};
+        double lastInk[3] = {-1.0, -1.0, -1.0};
+        for (int page = 0; page < 3; ++page) {
+            const PageMeasure m = measurePage(shot, page, paperH);
+            QTextStream(stdout) << "pagefix: 40% 第 " << page + 1 << " 页 纸顶=" << m.paperTop
+                                << (m.fullyVisible ? "（整页可见）" : "（只看到一部分）")
+                                << " 正文区=" << bodyTop << ".." << bodyBottom << " 墨=" << m.firstInk
+                                << ".." << m.lastInk << " 行数=" << m.bands << "\n";
+            if (!m.measurable || m.firstInk < 0.0)
+                continue;
+            ++measured;
+            bands[page] = m.bands;
+            firstInk[page] = m.firstInk;
+            lastInk[page] = m.lastInk;
+            const int rc = checkMargins(page, m, "40%");
+            if (rc != 0)
+                return rc;
+        }
+
+        if (bands[0] < 20) {
+            QTextStream(stderr) << "pagefix 失败：40% 下第 1 页只量到 " << bands[0]
+                                << " 行（120 行的文档应当装满一页）\n";
+            return 63;
+        }
+        if (bands[1] <= 0) {
+            QTextStream(stderr) << "pagefix 失败：40% 下第 2 页上一个字都没有"
+                                   "（120 行的文档应当有第 2 页内容）\n";
+            return 64;
+        }
+        if (qAbs(firstInk[0] - firstInk[1]) < 1.0 && qAbs(lastInk[0] - lastInk[1]) < 1.0
+            && bands[0] == bands[1]) {
+            QTextStream(stderr) << "pagefix 失败：第 2 页和第 1 页的墨**完全重合**（都是 "
+                                << firstInk[0] << ".." << lastInk[0] << "，" << bands[0]
+                                << " 行）—— 第 2 页又在画文档开头\n";
+            return 65;
+        }
+        QTextStream(stdout) << "pagefix: 40% 下量到 " << measured << " 页，第 1 页 " << bands[0]
+                            << " 行、第 2 页 " << bands[1] << " 行\n";
+    }
+
+    /*!
+     * 二、100%：一页纸比视口高，只能看一部分，判据是"墨别越出正文区"。
+     */
+    editor->setZoom(1.0);
+    editor->verticalScrollBar()->setValue(0);
+    settle();
+    {
+        const PageMeasure m = measurePage(grabViewport(), 0, editor->paperViewHeightPx());
+        QTextStream(stdout) << "pagefix: 100% 第 1 页 墨=" << m.firstInk << ".." << m.lastInk
+                            << " 行数=" << m.bands << "\n";
+        const int rc = checkMargins(0, m, "100%");
+        if (rc != 0)
+            return rc;
+    }
+
+    /**
+     * 二、一直往下打字：文档从"一页装不满"长到"好几页"，边打边量，
+     * 不许崩、不许把内容画到页边距外面去。
+     *
+     * 这条对应的是"写满了字就一定要崩"那个报告：只要文档高度
+     * 还有一点没被页高钉住、或者每页的切片窗口和纸对不齐，
+     * 打字打到跨页就会踩到。
+     */
+    {
+        editor->setZoom(1.0);
+        editor->verticalScrollBar()->setValue(0);
+        settle();
+        editor->setCurrentCharFormat(QTextCharFormat());
+        editor->setPlainText(QString());
+        editor->moveCursor(QTextCursor::Start);
+        settle();
+
+        const int batches = 8;
+        for (int b = 0; b < batches; ++b) {
+            for (int k = 0; k < 40; ++k) {
+                QTextCursor c = editor->textCursor();
+                c.movePosition(QTextCursor::End);
+                c.insertText(QStringLiteral("打字管%1 ").arg(b * 40 + k + 1));
+                c.insertBlock();
+                editor->setTextCursor(c);
+            }
+            /*!
+             * 量**最后一页**，不量第 1 页：打字打到第 n 页时，视口在文档末尾，
+             * 第 1 页的正文区早就滚到屏幕外面去了（那里量出来当然是空的）。
+             * 量最后一页才是"打字的人此刻看到的那张纸"。
+             */
+            editor->ensureCaretVisible();
+            settle();
+            const QImage shot = grabViewport();
+            /*!
+             * 纸高、纸宽都要**当场取**：这个自检中途换过比例尺，
+             * 循环外面抓的那个 `paperH` 还是 40% 时的值（449），
+             * 拿它去算"第 p 页在哪"会整段偏掉 —— 于是"看得见的那一页"
+             * 永远算成第 1 页，量出来一片空白（踩过）。
+             */
+            const double nowPaperH = editor->paperViewHeightPx();
+            const int pages = qMax(1, int(std::ceil(editor->document()->size().height()
+                                                    / nowPaperH)));
+            /*!
+             * 挑"当前屏幕上**最完整**的那张纸"来量。
+             *
+             * 不能挑"最后一个能量的"：滚到底时视口里往往同时有上一页的一小截
+             * 和这一页的大半张 —— 按顺序取最后那个会取到只有几个像素露出来的
+             * 那一页，量出来一片空白（踩过两次）。按"可见高度"挑最稳。
+             */
+            int top = 0;
+            double bestVisible = -1.0;
+            for (int p = 0; p < pages; ++p) {
+                const PageMeasure cand = measurePage(shot, p, nowPaperH);
+                const double visible = qMin(nowPaperH,
+                                            qMin(nowPaperH + cand.paperTop,
+                                                 double(editor->viewport()->height())
+                                                     - cand.paperTop));
+                if (visible > bestVisible) {
+                    bestVisible = visible;
+                    top = p;
+                }
+            }
+            const PageMeasure m = measurePage(shot, top, nowPaperH);
+            QTextStream(stdout) << "pagefix: 键入 " << (b + 1) * 40 << " 段 文档高="
+                                << editor->document()->size().height() << " 页数=" << pages
+                                << " 滚动=" << editor->verticalScrollBar()->value() << "/"
+                                << editor->verticalScrollBar()->maximum() << " 看得见的第 "
+                                << top + 1 << " 页(可见 " << bestVisible << "px) 墨=" << m.firstInk
+                                << ".." << m.lastInk << " 行数=" << m.bands << "\n";
+            const int rc = checkMargins(top, m, "打字");
+            if (rc != 0)
+                return rc;
+        }
+    }
+
+    /*!
+     * 三、缩放：满页文档来回缩放不许崩。
+     * Qt 的断言失败是**直接 abort**，所以"能走到下一行"本身就是判据。
+     */
+    const double zooms[] = {1.0, 0.25, 4.0, 1.5, 0.5, 1.0};
+    for (double z : zooms) {
+        editor->setZoom(z);
+        for (int i = 0; i < 10; ++i) {
+            QApplication::processEvents();
+            QThread::msleep(2);
+        }
+        const QImage shot = window.grab().toImage();
+        shot.save(QStringLiteral("%1/uitest_pagefix_zoom%2.png").arg(outDir).arg(int(z * 100)));
+        QTextStream(stdout) << "pagefix: 缩放 " << int(z * 100)
+                            << "% 绘制完成，纸宽=" << editor->paperViewWidthPx() << "\n";
+    }
+
+    editor->setZoom(1.0);
+    editor->verticalScrollBar()->setValue(0);
+    for (int i = 0; i < 10; ++i)
+        QApplication::processEvents();
+
+    QTextStream(stdout) << "pagefix: 分页自检通过（每页一份内容、四边页边距都管用、缩放不崩）\n";
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*!
  * 界面冒烟测试：真正建出主窗口、跑几个回合的事件循环、截图后退出。
  * 用来验证排版控件、效果层、工具栏这些没法用纯逻辑测的部分。
  * 用法： tripa.exe --uitest [输出目录] [light|dark]
@@ -1404,7 +1815,8 @@ static int runHandwritingNoiseProbe(MainWindow &window, const QString &outDir)
  *
  * 另有两个独立的参数：
  *   - zoom：视图缩放自检（见 runZoomProbe）；
- *   - hwnoise：给手写字加噪声的自检（见 runHandwritingNoiseProbe）。
+ *   - hwnoise：给手写字加噪声的自检（见 runHandwritingNoiseProbe）；
+ *   - pagefix：分页 / 页边距自检（见 runPageLayoutProbe）。
  */
 static int runUiTest(const QStringList &args)
 {
@@ -1415,6 +1827,7 @@ static int runUiTest(const QStringList &args)
     bool probeBaseline = false;
     bool probeZoom = false;
     bool probeHwNoise = false;
+    bool probePageFix = false;
     QString baselineDir;
     for (int i = 2; i < args.size(); ++i) {
         const QString a = args.at(i).toLower();
@@ -1428,6 +1841,8 @@ static int runUiTest(const QStringList &args)
             probeZoom = true;
         else if (a == QStringLiteral("hwnoise"))
             probeHwNoise = true;
+        else if (a == QStringLiteral("pagefix"))
+            probePageFix = true;
         else if (a == QStringLiteral("baseline"))
             probeBaseline = true;
         else if (a == QStringLiteral("baseline-dir") && i + 1 < args.size())
@@ -1493,6 +1908,16 @@ static int runUiTest(const QStringList &args)
             QTextStream(stderr) << "ui-test 失败：手写层默认应当遮住正文（机打字不该透出来）\n";
             return 34;
         }
+    }
+
+    /*!
+     * 分页体检放在光标/选区体检**之前**：它要自己写满一篇文档，
+     * 而后面那些体检各自会重设正文（谁先设谁说了算）。
+     */
+    if (probePageFix) {
+        const int rc = runPageLayoutProbe(window, outDir);
+        if (rc != 0)
+            return rc;
     }
 
     /*!

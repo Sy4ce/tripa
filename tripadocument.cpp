@@ -79,18 +79,357 @@ double clampedAttr(const QXmlStreamAttributes &attrs, const QString &name,
     return qBound(lo, value, hi);
 }
 
-// ---------------------------------------------------------------- 正文 / 效果区间
+// ---------------------------------------------------------------- 正文（纯文本 + 属性）
+/*
+ * 「不要直接把 html 存进去」这件事的做法：
+ *
+ * 正文写成**层次化的 xml**，每个字能带什么格式就用属性写出来，
+ * 文本本身原样放在 CDATA 里，一个字都不转义、不加工：
+ *
+ *   <content hash=... chars=... pageWidth=... pageHeight=...>
+ *     <p para="0"><r>普通文字在这里。</r>
+ *       <r family="SimSun" size="28">宋体二十八</r>
+ *       <r weight="700" italic="1" underline="1" color="#ffc81e28">粗斜下划线红</r></p>
+ *     <p para="1">…</p>
+ *   </content>
+ *
+ * 为什么不再嵌 HTML：Qt 的 `toHtml()` 塞进来的是一整份 `<html><head><style>…`
+ * 文档 —— 一个"排版工具自己的文档格式"里躺着一坨 HTML，既不好读也不好改，
+ * 而且 Qt 导 HTML 时会把长度值**四舍五入到整像素**、把字号写成 css 的 pt，
+ * 往返一趟格式就会悄悄走样（所以以前还得另写一份 `<blocks>` 来兜段落格式）。
+ * 自己写就没有这回事：属性写多少就是多少。
+ *
+ * 兼容：老文件里 `<content>` 里是一段 HTML 的 CDATA，读的时候照样认
+ * （见 finishContent 里的 state.html 分支），只是**不再**往里写。
+ */
+
+//! 单段文本的字节上限（防止误存一个巨大的文件）
+constexpr int kMaxContentBytes = 64 * 1024 * 1024;
 
 /*!
- * 取文档正文的 HTML（含逐字格式与段落格式）。
+ * \brief 一段文本 + 它的字符格式。
  *
- * Qt6 只留了无参的 `toHtml()`：写进来的 `<body>` 上带着默认字体，
- * 读回来时 Qt 会把它装回文档的默认字体 —— 往返之后连"没显式设过字体的字"
- * 都算得对，所以这里不需要额外带什么 css。
+ * 粒度按"格式变了就切一刀"来定，和 `QTextFragment` 一一对应
+ * （Qt 自己也把相邻同格式的字并成一个 fragment），所以合并之后
+ * 一个 `<r>` 往往就是一大段文字，不会一个字一个元素。
  */
-QString documentHtml(const QTextDocument *document)
+struct ContentRun
 {
-    return document ? document->toHtml() : QString();
+    QString text;
+    QTextCharFormat format;
+};
+
+struct ContentPara
+{
+    int number = 0;
+    QString text;
+    QVector<ContentRun> runs;
+};
+
+/*!
+ * \brief 一个字符格式里"看得见的那些属性"（排掉 Qt 的内部记账）。
+ *
+ * `QTextCharFormat::operator==` 比的是**整个属性表**，其中包含
+ * `QTextFormat::ObjectIndex` —— 那是 Qt 给"注册过的格式对象"编的内部号，
+ * 和显示效果毫无关系，可是同一个格式插进不同的 fragment 时它可能不一样。
+ * 直接拿 operator== 去合并相邻文本，会出现"一个字一个 `<r>`"的惨状
+ * （实测：一段普通文字被拆成 6 个元素，而另一段同样格式的却并成了一个）。
+ * 所以按"属性表去掉 ObjectIndex / ObjectType"来比。
+ */
+QVector<QPair<int, QVariant>> visibleProperties(const QTextCharFormat &format)
+{
+    QVector<QPair<int, QVariant>> out;
+    const QMap<int, QVariant> all = format.properties();
+    for (auto it = all.constBegin(); it != all.constEnd(); ++it) {
+        if (it.key() == QTextFormat::ObjectIndex || it.key() == QTextFormat::ObjectType)
+            continue;
+        out.append({it.key(), it.value()});
+    }
+    return out;
+}
+
+//! 只留"看得见的属性"的那一份格式（写文件用，免得把 Qt 的内部号也写出去）
+QTextCharFormat visibleFormat(const QTextCharFormat &format)
+{
+    QTextCharFormat out;
+    const QVector<QPair<int, QVariant>> props = visibleProperties(format);
+    for (const auto &entry : props)
+        out.setProperty(entry.first, entry.second);
+    return out;
+}
+
+/*!
+ * 把文档拆成"段落 -> 若干段同格式文本"。
+ *
+ * **必须逐 fragment 走，而且要按 fragment 的"有效字符格式"取**：
+ * 一个字符没显式设过字体时，`charFormat()` 是空的，而它实际是按文档默认字体
+ * （或者整段统一设过的那套格式）排的。只认 charFormat() 的话，
+ * 重开文件就会把默认字体丢掉。
+ */
+void scanContent(const QTextDocument *document, QVector<ContentPara> *out)
+{
+    out->clear();
+    if (!document)
+        return;
+
+    for (QTextBlock block = document->begin(); block.isValid(); block = block.next()) {
+        ContentPara para;
+        para.number = block.blockNumber();
+        for (QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            if (!fragment.isValid() || fragment.text().isEmpty())
+                continue;
+            const QTextCharFormat format = visibleFormat(fragment.charFormat());
+            para.text += fragment.text();
+            /*!
+             * 相邻的、格式一样的两段要并起来 ——
+             * 否则一次全选改字号会在文件里留下成百上千个 `<r>`。
+             */
+            if (!para.runs.isEmpty()
+                && visibleProperties(para.runs.last().format) == visibleProperties(format)) {
+                para.runs.last().text += fragment.text();
+            } else {
+                ContentRun run;
+                run.text = fragment.text();
+                run.format = format;
+                para.runs.append(run);
+            }
+        }
+        out->append(para);
+    }
+}
+
+//! 格式里那三样"单独存、别塞进 HTML"的：字色、下划线类型、竖排偏移
+void writeRunAttributes(QXmlStreamWriter &xml, const QTextCharFormat &format,
+                        const QFont &documentFont)
+{
+    QStringList families = format.fontFamilies().toStringList();
+    /*!
+     * **没显式设过字体的字，也要把它实际用的字体写出来。**
+     *
+     * 一个字符的 `charFormat()` 里可能根本没有字体属性，它显示成什么样
+     * 取决于文档的默认字体（`<font>` 那一块）。这种字如果属性一个都不写，
+     * 读回来就成了一块"没有格式"的文字 —— 渲染时跟着**读入方**的默认字体走，
+     * 换个环境打开就变样，往返比对（自检里那个逐字符签名）也对不上。
+     * 所以这里把"文档默认字体"当成实际字体补上，让文件**自足**。
+     */
+    if (families.isEmpty() && !documentFont.family().isEmpty() && format.fontPointSize() <= 0.0
+        && !format.hasProperty(QTextFormat::FontPointSize))
+        families = QStringList{documentFont.family()};
+    if (!families.isEmpty())
+        xml.writeAttribute(QStringLiteral("family"), families.join(QLatin1Char(',')));
+
+    const bool hasPointSize = format.hasProperty(QTextFormat::FontPointSize);
+    const bool hasPixelSize = format.hasProperty(QTextFormat::FontPixelSize);
+    if (hasPointSize)
+        xml.writeAttribute(QStringLiteral("size"), num(format.fontPointSize()));
+    else if (hasPixelSize)
+        xml.writeAttribute(QStringLiteral("pixelSize"),
+                           QString::number(format.intProperty(QTextFormat::FontPixelSize)));
+    else if (documentFont.pointSizeF() > 0.0)
+        xml.writeAttribute(QStringLiteral("size"), num(documentFont.pointSizeF()));
+    else if (documentFont.pixelSize() > 0)
+        xml.writeAttribute(QStringLiteral("pixelSize"),
+                           QString::number(documentFont.pixelSize()));
+
+    if (format.hasProperty(QTextFormat::FontWeight))
+        xml.writeAttribute(QStringLiteral("weight"), QString::number(format.fontWeight()));
+    if (format.hasProperty(QTextFormat::FontItalic) && format.fontItalic())
+        xml.writeAttribute(QStringLiteral("italic"), QStringLiteral("1"));
+    if (format.hasProperty(QTextFormat::FontStrikeOut) && format.fontStrikeOut())
+        xml.writeAttribute(QStringLiteral("strikeOut"), QStringLiteral("1"));
+
+    if (format.hasProperty(QTextFormat::TextUnderlineStyle)) {
+        const char *name = "single";
+        switch (format.underlineStyle()) {
+        case QTextCharFormat::NoUnderline:
+            name = "none";
+            break;
+        case QTextCharFormat::DashUnderline:
+            name = "dash";
+            break;
+        case QTextCharFormat::DotLine:
+            name = "dot";
+            break;
+        case QTextCharFormat::DashDotLine:
+            name = "dashDot";
+            break;
+        case QTextCharFormat::DashDotDotLine:
+            name = "dashDotDot";
+            break;
+        case QTextCharFormat::WaveUnderline:
+            name = "wave";
+            break;
+        case QTextCharFormat::SpellCheckUnderline:
+            name = "spellCheck";
+            break;
+        case QTextCharFormat::SingleUnderline:
+            break;
+        }
+        xml.writeAttribute(QStringLiteral("underline"), QLatin1String(name));
+    }
+    if (format.hasProperty(QTextFormat::TextVerticalAlignment)
+        && format.verticalAlignment() != QTextCharFormat::AlignNormal) {
+        const char *name = "super";
+        switch (format.verticalAlignment()) {
+        case QTextCharFormat::AlignSubScript:
+            name = "sub";
+            break;
+        case QTextCharFormat::AlignSuperScript:
+            break;
+        default:
+            name = "normal";
+            break;
+        }
+        xml.writeAttribute(QStringLiteral("valign"), QLatin1String(name));
+    }
+
+    /*!
+     * 颜色一律写成 `#aarrggbb` **八位**（HexArgb）：
+     * 带不带 alpha 都能一字不差地读回来，而 `#rrggbb` 会把半透明丢掉。
+     */
+    if (format.hasProperty(QTextFormat::ForegroundBrush))
+        xml.writeAttribute(QStringLiteral("color"),
+                           format.foreground().color().name(QColor::HexArgb));
+    if (format.hasProperty(QTextFormat::BackgroundBrush))
+        xml.writeAttribute(QStringLiteral("bg"),
+                           format.background().color().name(QColor::HexArgb));
+}
+
+void writeContent(QXmlStreamWriter &xml, const QTextDocument *document)
+{
+    QVector<ContentPara> paras;
+    scanContent(document, &paras);
+    const QFont documentFont = document ? document->defaultFont() : QFont();
+
+    for (const ContentPara &para : std::as_const(paras)) {
+        xml.writeStartElement(QStringLiteral("p"));
+        xml.writeAttribute(QStringLiteral("para"), QString::number(para.number));
+        if (para.runs.isEmpty()) {
+            // 空段落：没有 run，元素自己就是那个空行
+            xml.writeEndElement();
+            continue;
+        }
+        for (const ContentRun &run : std::as_const(para.runs)) {
+            xml.writeStartElement(QStringLiteral("r"));
+            writeRunAttributes(xml, run.format, documentFont);
+            xml.writeCDATA(run.text);
+            xml.writeEndElement();
+        }
+        xml.writeEndElement();
+    }
+}
+
+//! `<r>` 上的属性 -> 字符格式（写多少设多少，没写的保持默认）
+void readRunAttributes(const QXmlStreamAttributes &attrs, QTextCharFormat *format)
+{
+    if (!format)
+        return;
+    if (attrs.hasAttribute(QStringLiteral("family"))) {
+        const QString family = attrs.value(QStringLiteral("family")).toString();
+        const QStringList families = family.split(QLatin1Char(','), Qt::SkipEmptyParts);
+        if (families.size() > 1)
+            format->setFontFamilies(families);
+        else if (!family.isEmpty())
+            format->setFontFamilies({family});
+    }
+    if (attrs.hasAttribute(QStringLiteral("size"))) {
+        const double size = clampedAttr(attrs, QStringLiteral("size"), 0.0, 0.0, 1000.0);
+        if (size > 0.0)
+            format->setFontPointSize(size);
+    } else if (attrs.hasAttribute(QStringLiteral("pixelSize"))) {
+        bool ok = false;
+        const int px = attrs.value(QStringLiteral("pixelSize")).toInt(&ok);
+        if (ok && px > 0 && px < 2000)
+            format->setProperty(QTextFormat::FontPixelSize, px);
+    }
+    if (attrs.hasAttribute(QStringLiteral("weight"))) {
+        bool ok = false;
+        const int weight = attrs.value(QStringLiteral("weight")).toInt(&ok);
+        if (ok)
+            format->setFontWeight(qBound(1, weight, 1000));
+    }
+    if (attrs.hasAttribute(QStringLiteral("italic")))
+        format->setFontItalic(attrs.value(QStringLiteral("italic")) != QLatin1String("0"));
+    if (attrs.hasAttribute(QStringLiteral("strikeOut")))
+        format->setFontStrikeOut(attrs.value(QStringLiteral("strikeOut")) != QLatin1String("0"));
+    if (attrs.hasAttribute(QStringLiteral("underline"))) {
+        const QString style = attrs.value(QStringLiteral("underline")).toString();
+        QTextCharFormat::UnderlineStyle value = QTextCharFormat::SingleUnderline;
+        if (style == QLatin1String("none"))
+            value = QTextCharFormat::NoUnderline;
+        else if (style == QLatin1String("dash"))
+            value = QTextCharFormat::DashUnderline;
+        else if (style == QLatin1String("dot"))
+            value = QTextCharFormat::DotLine;
+        else if (style == QLatin1String("dashDot"))
+            value = QTextCharFormat::DashDotLine;
+        else if (style == QLatin1String("dashDotDot"))
+            value = QTextCharFormat::DashDotDotLine;
+        else if (style == QLatin1String("wave"))
+            value = QTextCharFormat::WaveUnderline;
+        else if (style == QLatin1String("spellCheck"))
+            value = QTextCharFormat::SpellCheckUnderline;
+        format->setUnderlineStyle(value);
+    }
+    if (attrs.hasAttribute(QStringLiteral("valign"))) {
+        const QString value = attrs.value(QStringLiteral("valign")).toString();
+        if (value == QLatin1String("sub"))
+            format->setVerticalAlignment(QTextCharFormat::AlignSubScript);
+        else if (value == QLatin1String("super"))
+            format->setVerticalAlignment(QTextCharFormat::AlignSuperScript);
+        else
+            format->setVerticalAlignment(QTextCharFormat::AlignNormal);
+    }
+    auto readColor = [&](const QString &name, bool foreground) {
+        if (!attrs.hasAttribute(name))
+            return;
+        QColor color(attrs.value(name).toString());
+        if (!color.isValid())
+            return;
+        if (foreground)
+            format->setForeground(color);
+        else
+            format->setBackground(color);
+    };
+    readColor(QStringLiteral("color"), true);
+    readColor(QStringLiteral("bg"), false);
+}
+
+/*!
+ * 把新格式的正文装进文档。
+ *
+ * 用 `QTextCursor::insertText(text, format)` 而不是拼一份 HTML 再 `setHtml()`：
+ * 自己插的字，字符格式**一个属性都不多不少**，也不经过 HTML 解析器
+ * 那套"四舍五入到整像素 / 字号写 pt"的换算。
+ *
+ * 段落一律用 `insertBlock()` 分开（哪怕前后两段是空的），
+ * 段落序号（`<blocks>` 里的 `para`）才和文档里的 block 一一对应。
+ */
+void buildDocumentFromParagraphs(QTextDocument *document, const QVector<ContentPara> &paragraphs)
+{
+    if (!document)
+        return;
+
+    QTextCursor cursor(document);
+    cursor.beginEditBlock();
+    /*!
+     * 先把原来的内容整段删掉。`setPlainText` 会**带着当前字符格式**插入
+     * （Qt 有意这么设计），所以这里宁可走"清空 + 逐段插"，
+     * 也不要先设一批文字再补格式 —— 那会在中途触发重排、还可能把
+     * 当前格式漏进正文里。
+     */
+    cursor.select(QTextCursor::Document);
+    cursor.removeSelectedText();
+
+    for (int index = 0; index < paragraphs.size(); ++index) {
+        const ContentPara &para = paragraphs.at(index);
+        if (index > 0)
+            cursor.insertBlock(QTextBlockFormat(), QTextCharFormat());
+        for (const ContentRun &run : para.runs)
+            cursor.insertText(run.text, run.format);
+    }
+    cursor.endEditBlock();
 }
 
 /*!
@@ -606,7 +945,22 @@ QString summarizeRuns(const QVector<EffectRun> &runs)
 struct ReadState
 {
     DocumentData *data = nullptr;
+    /*!
+     * 老文件（kFormatVersion 1）里 `<content>` 装的是**一段 HTML 的 CDATA**，
+     * 新文件里是 `<p>` / `<r>` 的结构。两者都读得进来：
+     * `html` 只给老文件用，`paragraphs` 只给新文件用。
+     */
     QString html;
+    QVector<ContentPara> paragraphs;  //!< 新格式的正文
+    bool hasParagraphs = false;       //!< 见到过 <p>：这份文件是新格式
+
+    //! 正在攒的那一段（<p> 到 </p> 之间）
+    ContentPara currentPara;
+    bool inPara = false;
+    //! 正在攒的那一段文本（<r> 到 </r> 之间）
+    ContentRun currentRun;
+    bool inRun = false;
+
     QVector<EffectRun> runs;
     QVector<QPair<int, QTextBlockFormat>> blocks;  //!< 段落序号 -> 段落格式
     QVector<NoiseWave::Term> waveTerms;
@@ -675,6 +1029,25 @@ void handleStartElement(const QXmlStreamReader &reader, ReadState *state)
             state->pageSize = QSizeF(w, h);
             state->hasPageSize = true;
         }
+    } else if (name == QLatin1String("p")) {
+        /*!
+         * 新格式的段落。`para` 属性只是**给人看的**（和 `<blocks>` 里的序号对得上），
+         * 装文档时按出现顺序来 —— 文件被手改得序号乱了也不会把段落插错位置。
+         *
+         * 见到 `<p>` 就算"有正文"：空文档就是**一个空段落**，
+         * 里面一个 `<r>` 都没有，不能因此把它当成"文件里没有正文"。
+         */
+        state->inPara = true;
+        state->hasParagraphs = true;
+        state->sawContent = true;
+        state->currentPara = ContentPara();
+        bool ok = false;
+        const int para = attrs.value(QStringLiteral("para")).toInt(&ok);
+        state->currentPara.number = ok ? para : state->paragraphs.size();
+    } else if (name == QLatin1String("r")) {
+        state->inRun = true;
+        state->currentRun = ContentRun();
+        readRunAttributes(attrs, &state->currentRun.format);
     }
 }
 
@@ -779,11 +1152,11 @@ QString tripaDocumentToXml(const QTextDocument *document,
         return QString();
     }
 
-    const QString html = documentHtml(document);
-    if (html.toUtf8().size() > kMaxHtmlBytes) {
+    const QString plain = document->toPlainText();
+    if (plain.toUtf8().size() > kMaxContentBytes) {
         if (error)
-            *error = QStringLiteral("文档太大（正文 HTML 超过 %1 MB）")
-                         .arg(kMaxHtmlBytes / (1024 * 1024));
+            *error = QStringLiteral("文档太大（正文超过 %1 MB）")
+                         .arg(kMaxContentBytes / (1024 * 1024));
         return QString();
     }
 
@@ -804,9 +1177,9 @@ QString tripaDocumentToXml(const QTextDocument *document,
     xml.writeAttribute(QStringLiteral("saved"),
                        QDateTime::currentDateTime().toString(Qt::ISODate));
     xml.writeComment(QStringLiteral(
-        " tripa 排版文档：正文与逐字格式（含段落）在这个文件的 content 元素里，"
-        "用的是 Qt 的 HTML；手写 / 扭曲这类效果不进排版，单独记成字符区间。"
-        " 详见 README 第 2.9 节。"));
+        " tripa 排版文档：正文是纯文本，格式（字体/字号/粗斜/下划线/颜色）写在 "
+        "content 里的 r 元素属性上，段落格式在 blocks 里；手写 / 扭曲这类效果"
+        "不进排版，单独记成字符区间。详见 README 第 2.9 节。"));
 
     /*!
      * `<effects>` 只有一个：种子是它的属性，两个渲染参数块是它的子元素。
@@ -838,11 +1211,11 @@ QString tripaDocumentToXml(const QTextDocument *document,
     }
 
     /*
-     * 正文放最后：用 CDATA 原样嵌 HTML —— 转义成 &lt;p&gt; 的话文件就没法看了，
-     * 而 Qt 的 toHtml() 本身就是自洽的 xml，CDATA 里的 & 和 < 都不成问题。
+     * 正文放最后：每段一个 `<p>`，段内按"格式变了就切一刀"分 `<r>`，
+     * 文本原样放在 CDATA 里（转义成 &lt; 的话文件就没法看了）。
      */
     xml.writeStartElement(QStringLiteral("content"));
-    xml.writeAttribute(QStringLiteral("hash"), contentHash(document->toPlainText()));
+    xml.writeAttribute(QStringLiteral("hash"), contentHash(plain));
     xml.writeAttribute(QStringLiteral("chars"), QString::number(document->characterCount() - 1));
     /*!
      * 正文栏尺寸（QTextDocument::pageSize）：定断行的那个宽度。
@@ -854,7 +1227,7 @@ QString tripaDocumentToXml(const QTextDocument *document,
         xml.writeAttribute(QStringLiteral("pageWidth"), num(document->pageSize().width()));
         xml.writeAttribute(QStringLiteral("pageHeight"), num(document->pageSize().height()));
     }
-    xml.writeCDATA(html);
+    writeContent(xml, document);
     xml.writeEndElement();
 
     xml.writeEndElement(); // tripaDocument
@@ -906,10 +1279,35 @@ bool tripaDocumentFromXml(QTextDocument *document,
                 continue;
             }
             handleStartElement(xml, &state);
-        } else if (xml.isCharacters() && !xml.isWhitespace()) {
-            // 只可能是 <content> 里的 CDATA（其余元素的文本都是空白）
-            state.sawContent = true;
-            state.html += xml.text().toString();
+        } else if (xml.isEndElement()) {
+            const QString name = xml.name().toString();
+            if (name == QLatin1String("r") && state.inRun) {
+                state.inRun = false;
+                state.currentPara.text += state.currentRun.text;
+                if (!state.currentRun.text.isEmpty())
+                    state.currentPara.runs.append(state.currentRun);
+                state.currentRun = ContentRun();
+            } else if (name == QLatin1String("p") && state.inPara) {
+                state.inPara = false;
+                state.paragraphs.append(state.currentPara);
+                state.currentPara = ContentPara();
+            }
+        } else if (xml.isCharacters()) {
+            const QString text = xml.text().toString();
+            /*!
+             * 文本只从 `<r>` 里面收：`<p>` 之间那些缩进换行是
+             * `setAutoFormatting(true)` 自己写的，收进来会凭空多出空行。
+             *
+             * 老文件的正文是一段 HTML 的 CDATA，那时候不在 `<r>` 里，
+             * 走下面那个分支（按"非空白"判断，和原来一样）。
+             */
+            if (state.inRun) {
+                state.currentRun.text += text;
+                state.sawContent = true;
+            } else if (!xml.isWhitespace()) {
+                state.sawContent = true;
+                state.html += text;
+            }
         } else if (xml.hasError()) {
             break;
         }
@@ -935,7 +1333,10 @@ bool tripaDocumentFromXml(QTextDocument *document,
      * （它只排 NaN），照那个条件写回去等于把 -1 又设了一遍。
      */
     const QSizeF keepPageSize = document->pageSize();
-    document->setHtml(state.html);
+    if (state.hasParagraphs)
+        buildDocumentFromParagraphs(document, state.paragraphs);
+    else
+        document->setHtml(state.html);
     if (state.hasPageSize)
         document->setPageSize(state.pageSize);
     else if (keepPageSize.width() > 0.0 && keepPageSize.height() > 0.0)

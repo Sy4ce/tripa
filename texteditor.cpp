@@ -378,13 +378,28 @@ void TextEditor::mouseReleaseEvent(QMouseEvent *event)
  */
 void TextEditor::updateScrollRange()
 {
-    const QMarginsF body = m_pageSetup.bodyMarginsPx();
     const QSizeF content = document()->size();
+    const double paperHeight = paperHeightPx();
 
-    // 滚动值是**视图像素**（见 paperOriginInViewport），所以整张纸的高度要乘缩放
-    const double totalHeight = (body.top() + content.height() + body.bottom()) * m_zoom;
-    verticalScrollBar()->setRange(0, qMax(0, int(std::ceil(totalHeight))
-                                                 - viewport()->height()));
+    /*!
+     * 滚动范围钉在**整张纸**上（不是"正文一连串排下来"那个高度），
+     * 而且用 `paperHeight * 页数` 算，不再"正文高 + 上下边距"——
+     * 后者在 `pageSize` = 纸高之后就等于前者，两个都留着迟早会不一致。
+     */
+    const int pages = qMax(1, int(std::ceil(content.height() / qMax(1.0, paperHeight))));
+    const double totalHeight = paperHeight * pages * m_zoom;
+    /*!
+     * 上限再收一道：**正文的最后一行要能停在视口底边**。
+     *
+     * 只按整张纸算的话，一页正文装到纸高一半时，滚到底会看到"页面底部
+     * 那一大片空白"——用户会觉得"滚过头了，纸下面还有一截看不见的东西"
+     * （实测：滚到底时视口里一个字都没有）。收到"最后一行贴底"就自然了。
+     */
+    const double contentEnd = (bodyOriginPx().y() + content.height()) * m_zoom;
+    const int maxByContent = int(std::ceil(contentEnd)) - viewport()->height();
+    verticalScrollBar()->setRange(0, qMax(0, qMin(int(std::ceil(totalHeight))
+                                                      - viewport()->height(),
+                                                  maxByContent)));
     verticalScrollBar()->setPageStep(viewport()->height());
 
     const int pad = int(std::lround(paperPadPx()));
@@ -411,13 +426,29 @@ void TextEditor::updatePageMargins()
  *   直接按 viewport 宽度断行。纸张居中之后 viewport 比正文区宽得多，
  *   所以必须显式把换行宽度钉在"正文宽度"上，断行位置才等于打印时的断行位置。
  *   两处都要设：document()->setPageSize() 决定分页高度，换行宽度决定每行长度。
+ *
+ * **分页高度 = 整张纸的高度，不是正文区的高度。**
+ *
+ * 这一点是整个分页模型的地基，写错过一次、症状很吓人：
+ *   - 设成正文区高度时，文档高度是"正文一连串地排下来"，
+ *     而屏幕上每张纸的正文区是隔一个**纸高**放一个的 ——
+ *     两者对不上，第 n 页的窗口里出现的其实是"文档里隔了一个下边距的那一段"，
+ *     于是第 2 页起内容在纸上的位置整体偏移，还会**越过下边距**；
+ *     正文一页装不下就更加离谱：同一份内容会在后面每一页上原样重来一遍
+ *     （用户看到的"后三页内容完全一样，还多出几个蓝色虚线框"就是这个）。
+ *   - 设成纸高之后，"第 n 页正文区" = 文档里第 n 个纸高那一段 + 上边距，
+ *     和屏幕上纸的位置**逐页对齐**，一页一份内容，四边页边距一律有效。
+ *
+ * 上下都不留白要靠绘制时的裁剪：正文只画在 [上边距, 上边距+正文高) 里
+ * （见 paintEvent），所以下边距也永远不会有字。
  */
 void TextEditor::applyLayoutMetrics()
 {
     const QSizeF body = m_pageSetup.bodySizePx();
+    const double paperHeight = paperHeightPx();
 
     document()->setDocumentMargin(0);
-    document()->setPageSize(body);
+    document()->setPageSize(QSizeF(body.width(), qMax(body.height(), paperHeight)));
 
     setLineWrapMode(QTextEdit::FixedPixelWidth);
     setLineWrapColumnOrWidth(int(std::lround(body.width())));
@@ -667,13 +698,12 @@ void TextEditor::paintEvent(QPaintEvent *event)
     const double paperW = paperViewWidthPx();
     const double paperH = paperViewHeightPx();
     /*!
-     * 正文区尺寸分两套口径，**不能混**：
-     *   - bodyDocSize 是文档坐标（= 100% 的像素数），排版、裁剪、效果层都用它；
-     *   - bodyViewSize 是屏幕上的大小，画虚框提示、算页位置用它。
-     * 两者只差一个缩放倍数，混用就是"纸对得上、正文对不上"。
+     * 正文区尺寸只有一套口径：**文档坐标**（= 100% 的像素数）。
+     * 排版、裁剪、挖洞、效果层、页码位置全用它。
+     * 屏幕上的大小另算（乘 m_zoom），但只出现在"给绘制变换乘一个倍数"那里
+     * ——屏幕上不再需要按"正文区在屏幕上多大"去画任何东西了。
      */
     const QSizeF bodyDocSize = m_pageSetup.bodySizePx();
-    const QSizeF bodyViewSize = bodyDocSize * m_zoom;
     const QPointF paperOrigin = paperOriginInViewport();
     const QPointF docOrigin = documentOriginInViewport();
     const int scrollY = verticalScrollBar()->value();
@@ -801,13 +831,25 @@ void TextEditor::paintEvent(QPaintEvent *event)
         painter.save();
         painter.setClipRect(pageRect);
 
+        /*!
+         * 第 2 页起在纸的**下边距**里写一行小字页码
+         * （"第 2 页 / 共 5 页"），正文区里什么都不画。
+         *
+         * 这里以前画的是正文区的**蓝色虚线框** —— 那是个很坏的设计：
+         * 虚线框和正文区一样大，看着就像"凭空多出来一页"，
+         * 而且当时正文的位置又确实不对（见 applyLayoutMetrics 里那段），
+         * 于是"后几页内容一模一样"成了用户看到的样子。
+         * 页码写在页边距里，既说明了这是第几页，又不会和正文混淆。
+         */
         if (page > 0) {
-            // 后续页面的正文区域提示（虚线框），方便看排版范围
-            const QRectF bodyRect(docOrigin + QPointF(0.0, page * paperH),
-                                  bodyViewSize);
-            painter.setPen(QPen(QColor(70, 130, 200), 1, Qt::DashLine));
-            painter.setBrush(Qt::NoBrush);
-            painter.drawRect(bodyRect);
+            painter.setPen(QColor(0x9a, 0x9d, 0xa2));
+            QFont pageFont = font();
+            pageFont.setPointSizeF(qMax(6.0, pageFont.pointSizeF() * 0.8));
+            painter.setFont(pageFont);
+            const QRectF footer(pageRect.left(), pageRect.bottom() - bodyOriginPx().y() * 0.6,
+                                pageRect.width(), bodyOriginPx().y() * 0.6);
+            painter.drawText(footer, Qt::AlignHCenter | Qt::AlignVCenter,
+                             tr("第 %1 页").arg(page + 1));
         }
 
         /*!

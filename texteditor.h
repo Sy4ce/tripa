@@ -106,6 +106,18 @@ public:
 public slots:
     void updateOverlayGeometry();
     void updateScrollRange();
+    /*!
+     * 把光标滚进可视区，用**视图像素**算。
+     *
+     * Qt 自己的自动滚动（QWidgetTextControl 里那套）把"文档像素"和
+     * "视口像素"当成一回事，缩放之后这两者差一个倍数 —— 于是
+     * 放大到 200% 时光标跑到屏幕外面，Qt 还认为它是可见的，一个字都不滚。
+     * 键盘事件走完之后补一次这里，光标就一定看得见。
+     *
+     * 公开是为了让自检能复现"打字的人眼睛盯着光标"这件事
+     * （见 --uitest 的 pagefix：边打边量，视口跟着光标走）。
+     */
+    void ensureCaretVisible();
 
     /*!
      * 鼠标处理放在 public 是有意的：自检（--uitest）需要直接驱动这三个入口
@@ -151,15 +163,6 @@ private:
     QRect caretRectInDocument() const;
     //! 缩放的真正实现：改比例、重算滚动范围，再把锚点那一格摆回原处
     void applyZoom(double zoom, const QPointF &viewportAnchor);
-    /*!
-     * 把光标滚进可视区，用**视图像素**算。
-     *
-     * Qt 自己的自动滚动（QWidgetTextControl 里那套）把"文档像素"和
-     * "视口像素"当成一回事，缩放之后这两者差一个倍数 —— 于是
-     * 放大到 200% 时光标跑到屏幕外面，Qt 还认为它是可见的，一个字都不滚。
-     * 键盘事件走完之后补一次这里，光标就一定看得见。
-     */
-    void ensureCaretVisible();
 
     PageSetup m_pageSetup;
     EffectRenderOptions m_options;

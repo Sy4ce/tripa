@@ -329,7 +329,14 @@ static void testXmlRoundTrip()
                               .arg(error.isEmpty() ? QStringLiteral("成功") : error));
     CHECK(xml.startsWith(QStringLiteral("<?xml")), "是 xml（带声明）");
     CHECK(xml.contains(QStringLiteral("<tripaDocument")), "有根元素 tripaDocument");
-    CHECK(xml.contains(QStringLiteral("<![CDATA[")), "正文用 CDATA 原样嵌着（没被转义成 &lt;）");
+    /*!
+     * 正文必须是**纯文本 + 属性**，不许再把一整份 HTML 塞进文件里
+     * （format version 2 起改成 `<p>` / `<r>`；老文件里的 HTML 仍然读得进来）。
+     */
+    CHECK(xml.contains(QStringLiteral("<p para=\"0\">")) && xml.contains(QStringLiteral("<r ")),
+          "正文是 <p>/<r> 结构（纯文本 + 属性），不是嵌进去的 HTML");
+    CHECK(!xml.contains(QStringLiteral("<html")) && !xml.contains(QStringLiteral("qt-")),
+          "文件里没有 Qt 导出的 HTML 痕迹（<html> / qt-* 样式）");
 
     // xml 本身要能被解析器吃掉（自洽的 xml，不是"看起来像"）
     {
@@ -518,6 +525,14 @@ static void testXmlRoundTrip()
         }
         CHECK(stripTimestamp(xml) == stripTimestamp(again),
               "存 -> 读 -> 再存，xml 逐字节相同（除时间戳）");
+
+        /*!
+         * 把 `<content>` 那一段打出来：格式改过好几轮，这份"人直接看到的正文"
+         * 到底长什么样，看一眼比读十条断言有用（自检输出里留一份样例）。
+         */
+        qInfo().noquote() << "       xml 里的 <content> 段：\n"
+                          << xml.section(QStringLiteral("<content"), 1, 1)
+                                 .section(QStringLiteral("</content>"), 0, 0);
     }
 
     // --- 逐字格式（最后做：先把原文里"隐式默认字体"显式化，才和读回来的文档同一口径）
@@ -528,6 +543,82 @@ static void testXmlRoundTrip()
         qInfo().noquote() << "       " << line;
     CHECK(formatDiffs == 0, QStringLiteral("逐字符格式（字体/字号/粗斜/下划线/颜色）%1 处差异")
                                 .arg(formatDiffs));
+}
+
+/*!
+ * 正文的 xml 到底长什么样。
+ *
+ * 这是"别把 HTML 存进去"这条要求的正面验收：
+ *   - 一段纯文字（不带效果）必须**并成一个 `<r>`**，不能一个字一个元素
+ *     —— `QTextFragment` 是**按字符**存的（实测 12 个字就是 12 个 fragment，
+ *       哪怕格式一模一样），所以扫描时必须自己按格式合并；
+ *   - 换字体/加粗的地方要切一刀，属性写在 `<r>` 上；
+ *   - 换行是 `<p>`，段落序号写在 `para` 上；
+ *   - 文件里不许出现 Qt 导出的 HTML（`<html>` / `qt-*`）。
+ *
+ * 顺便把生成的那段 xml 打出来，格式改了几轮之后"人看到的正文"一眼就能看。
+ */
+static void testContentIsNotHtml()
+{
+    qInfo().noquote() << "正文写成纯文本 + 属性（不嵌 HTML）";
+
+    QTextDocument doc;
+    doc.setDefaultFont(QFont(QStringLiteral("Microsoft YaHei"), 12));
+    doc.setPageSize(QSizeF(400, 600));
+
+    QTextCursor c(&doc);
+    c.insertText(QStringLiteral("普通文字一段。"));
+    QTextCharFormat bold;
+    bold.setFontWeight(QFont::Bold);
+    bold.setForeground(QColor(200, 30, 40));
+    c.insertText(QStringLiteral("加粗红色"), bold);
+    /*!
+     * 插完之后**必须把当前格式复位**：`insertText()` 之后 QTextCursor 会
+     * 记住刚刚用过的那套格式（Qt 有意这么设计，方便接着写同样格式的字），
+     * 不复位的话后面这段"又普通了"其实还是加粗红的。
+     */
+    c.setCharFormat(QTextCharFormat());
+    c.insertText(QStringLiteral("又普通了"));
+    c.insertBlock();
+    c.insertText(QStringLiteral("第二段"));
+
+    QString error;
+    const QString xml =
+        tripadoc::tripaDocumentToXml(&doc, PageSetup(), EffectRenderOptions(), nullptr, 1u, &error);
+    CHECK(!xml.isEmpty(), QStringLiteral("生成 xml：%1").arg(error));
+
+    const QString content = xml.section(QStringLiteral("<content"), 1, 1);
+    const int runs = content.count(QStringLiteral("<r"));
+    const int paras = content.count(QStringLiteral("<p "));
+    QTextStream(stdout) << "       正文 xml：\n" << content.section(QStringLiteral("</content>"), 0, 0);
+
+    CHECK(paras == 2, QStringLiteral("两个段落就是两个 <p>（实际 %1）").arg(paras));
+    /*!
+     * 19 个字里只有 3 套格式（普通 / 加粗红 / 又普通），所以最多 4 个 `<r>`：
+     * 前两段普通文字并成一个、加粗红一个、末尾普通一个、第二段一个。
+     * "一个字一个元素"那种写法这里会数出十几个，立刻炸。
+     */
+    CHECK(runs <= 4, QStringLiteral("同格式的相邻文字并在一起了（%1 个 <r>，%2 个字）")
+                         .arg(runs)
+                         .arg(doc.characterCount() - 1));
+    CHECK(content.contains(QStringLiteral("weight=\"700\"")), "加粗写成了 weight");
+    CHECK(content.contains(QStringLiteral("color=\"#ffc81e28\"")), "颜色写成了 #aarrggbb");
+    CHECK(!xml.contains(QStringLiteral("<html")) && !xml.contains(QStringLiteral("qt-")),
+          "文件里没有 HTML 痕迹");
+
+    // 往返：文字和格式都要原样回来
+    QTextDocument loaded;
+    tripadoc::DocumentData data;
+    CHECK(tripadoc::tripaDocumentFromXml(&loaded, xml, &data, &error),
+          QStringLiteral("读回来：%1").arg(error));
+    CHECK(loaded.toPlainText() == doc.toPlainText(), "正文一字不差");
+    CHECK(loaded.blockCount() == doc.blockCount(), "段落数一致");
+    /*!
+     * 逐字符比格式之前，先给原文里"没显式设过字体"的字符按文档默认字体显式化一遍：
+     * 文件里每个 run 都写全了字体（见 writeRunAttributes），读回来自然是显式的。
+     */
+    materializeDefaultFont(&doc);
+    CHECK(countFormatDiffs(doc, loaded, nullptr) == 0, "逐字符格式一致");
 }
 
 /*!
@@ -605,9 +696,9 @@ static void testEditedContentSkipsEffects()
     const int contentStart = text.lastIndexOf(QStringLiteral("<content"));
     CHECK(contentStart > 0, "找到 <content>");
     text.truncate(contentStart);
-    text += QStringLiteral("<content hash=\"deadbeef\"><![CDATA[<html><body>"
-                           "<p style=\"margin:0;\">完全不同的正文</p></body></html>]]></content>"
-                           "</tripaDocument>");
+    text += QStringLiteral("<content hash=\"deadbeef\">"
+                           "<p para=\"0\"><r>完全不同的正文</r></p>"
+                           "</content></tripaDocument>");
 
     QTextDocument loaded;
     tripadoc::DocumentData data;
@@ -819,6 +910,7 @@ int main(int argc, char **argv)
 
     testNoiseWaveRoundTrip();
     testXmlRoundTrip();
+    testContentIsNotHtml();
     testFileRoundTrip();
     testEditedContentSkipsEffects();
     testBrokenInput();

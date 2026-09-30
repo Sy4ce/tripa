@@ -95,6 +95,22 @@ if ($Targets -contains 'tripa') {
         Compile "$Root/$s" "$Build/$obj" @()
         $objs += $obj
     }
+    <#
+        Windows 资源（程序图标 + 版本信息）。
+        用 windres 编成 .o 再链接：exe 自己不带 RT_GROUP_ICON 的话，
+        资源管理器里显示的就是默认白板图标（Qt 的 setWindowIcon 管不到那儿）。
+        CMake 那条路是自动的（tripa.rc 已经加进 PROJECT_SOURCES），手工这条路自己来。
+        注意 **工作目录必须是仓库根**：tripa.rc 里的 ICON 是相对路径 "tripa.ico"，
+        windres 是按它自己的当前目录找的（不是按 .rc 文件的位置）。
+    #>
+    New-Item -ItemType Directory -Force -Path "$Build/winres" | Out-Null
+    Invoke-Step 'windres tripa.rc' {
+        Push-Location $Root
+        & "$Mingw/windres.exe" '-i' 'tripa.rc' '-o' "$Build/winres/tripa_rc.o"
+        Pop-Location
+        if ($LASTEXITCODE -ne 0) { throw "windres 失败（exit $LASTEXITCODE）" }
+    }
+    $objs += 'winres/tripa_rc.o'
     foreach ($extra in @('tripa_autogen/mocs_compilation.cpp',
                          'tripa_autogen/EWIEGA46WW/qrc_resources.cpp')) {
         $obj = "CMakeFiles/tripa.dir/$extra.obj"

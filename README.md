@@ -43,13 +43,14 @@ cmake --build build
 # New-Item -ItemType Directory -Force -Path build\uitest）
 
 # 纯逻辑单测：CSV 解析、手写库、噪声波、笔画扭曲、效果属性（含"套扭曲保留手写"）、
-# 字符分类、基线校正 xml（90 项）
-# 注意：其中"写 CSV / 写校正 xml"那几项需要能往临时目录里写文件
+# 字符分类、基线校正 xml（90 项；本机能跑过 77 项）
+# 注意：其中"写 CSV / 写校正 xml"那 13 项需要能往**新建的临时目录**里写文件，
+# 受限沙箱里会失败（是环境限制，不是程序的问题）
 cmake --build build --target test_core
 .\build\test_core.exe
 
 # 文档格式往返：正文 / 逐字格式 / 段落格式 / 效果区间 / 页面设置 / 渲染参数 /
-# 噪声波逐点 / 渲染结果逐像素（约 40 项），外加一次真写盘再读回
+# 噪声波逐点 / 渲染结果逐像素 / "正文不许是 HTML"（90 项），外加一次真写盘再读回
 cmake --build build --target test_document
 .\build\test_document.exe
 
@@ -72,10 +73,20 @@ cmake --build build --target test_document
 # 以及"缩放不改文档"
 .\build\tripa.exe --uitest build\uitest light zoom
 
+# 分页 / 页边距：40% 下第 1、2 页必须各有各的内容（不许"每页都画文档开头"）、
+# 每张纸上的墨都必须落在四边页边距里面；再一直往下打字到第 8 页、
+# 在 25%~400% 之间来回缩放，全程不许崩
+.\build\tripa.exe --uitest build\uitest light pagefix
+
 # 只跑基线调整对话框那一组：开对话框 -> 自动对齐 -> 改 spinbox -> 关窗口写 xml -> 重读，
 # 顺带截校对表和对话框的图（加 baseline-dir <目录> 换成对着自己的数据跑）
 .\build\tripa.exe --uitest build\uitest baseline
 ```
+
+> **跑之前先跑一次 `python tools\make_icon.py`**（如果 `icons/tripa.ico` 不在）：
+> exe 的图标资源（`tripa.rc`）引用的是它，缺了文件 windres 会直接报错。
+> 生成的 png 给 Qt 运行时用（窗口左上角 / 任务栏），ico 是给 Windows 资源管理器、
+> Alt+Tab、文件属性看的 —— 两者缺一不可，见 5. "程序图标为什么要嵌进 exe"。
 
 > 受限沙箱（不允许子进程新建目录、或者不允许 CMake 的 AutoMoc 去抓 moc 输出）里，
 > `cmake --build` 可能卡住或上面几项写盘自检会失败 —— 那是环境限制，不是程序的问题。
@@ -358,6 +369,38 @@ Ctrl+D 作用在这几种字上时是这样的（判据在 `distortionEffectKind
 > 现在统一走 `caretRectInDocument()`（把它加回来），自检里用空行文档 +
 > 滚动 200 截图量竖条位置来钉住这一条。
 
+### 2.6.1 分页：一页一份内容，四边页边距都管用
+
+屏幕上一张纸接一张纸地画，正文按"一页一份"切进去。这里有一条**地基级**的约定：
+
+```
+QTextDocument::pageSize() 的分页高度 = 整张纸的高度（不是正文区的高度）
+```
+
+因为文档坐标的排法是"第 n 页正文区左上角 = (0, n × 纸高)"，而屏幕上纸的
+间距也是"一个纸高" —— 两者必须对齐。以前把分页高度设成了**正文区**高度
+（纸高减去上下边距），于是第 n 页的窗口里出现的其实是"文档里隔了一个下边距的
+那一段"，症状是：
+
+* 第 2 页起内容在纸上的位置整体偏移一个下边距，**越进下边距里**；
+* 正文一页装不下时更离谱：同一份内容在后面每一页上**原样重来一遍**
+  （还各带一个"正文区提示"的蓝色虚线框，看着就像凭空多出来的页）；
+* 一页装满了字再缩放，Qt 的排版和这套错位的窗口互相踩，程序直接崩。
+
+现在：
+
+* 分页高度 = 纸高 → 第 n 页正文区正好落在第 n 张纸的上边距里面；
+* 每页画正文时**只裁到正文区**（`setClipRect(0, 0, 正文宽, 正文高)`），
+  所以文字永远不会跑到上/下边距里；
+* 第 2 页起不再画那个容易误会的虚线框，改成在**下边距**里写一行小字页码
+  （`第 2 页`），正文区里干干净净；
+* 滚动范围按"整张纸 × 页数"算，再收一道"最后一行能停在视口底边"，
+  免得滚到底只看见一片空白。
+
+自检是 `--uitest <目录> light pagefix`（见 1. 自带的四套自检），它把
+比例尺调到 40%（这时一张 A4 只有 449 高，第 1、2 页**同时**在画面上）
+逐页量"纸上的墨落在哪儿"，再单独跑一遍"一直往下打字到第 8 页 + 几档缩放"。
+
 ### 2.7 打印与导出
 
 * **文件 → 打印（Ctrl+P）**：标准打印对话框，正文 + 手写 + 扭曲一起输出。
@@ -402,7 +445,7 @@ Ctrl+D 作用在这几种字上时是这样的（判据在 `distortionEffectKind
 
 ```
 <?xml version="1.0" encoding="UTF-8"?>
-<tripaDocument version="1" generator="tripa" saved="2025-01-01T12:00:00">
+<tripaDocument version="2" generator="tripa" saved="2025-01-01T12:00:00">
     <!-- seed = 全局随机种子：噪声波、逐字效果的种子都从它来 -->
     <effects seed="1234567">
         <handwriting visible="true" replaceText="true" pressureToWidth="0.2"/>
@@ -429,10 +472,11 @@ Ctrl+D 作用在这几种字上时是这样的（判据在 `distortionEffectKind
         <run start="6" end="8" kind="handwriting" seed="1234568"/>
     </runs>
     <!-- 正文栏尺寸（pageWidth/pageHeight）就是断行宽度，不存的话重开就乱断行 -->
-    <content hash="9f86d081..." chars="31" pageWidth="646" pageHeight="970"><![CDATA[
-        <html><head>...</head><body style=" font-family:'Microsoft YaHei'; ...">
-        <p style="...">正文与逐字格式都在这里</p></body></html>
-    ]]></content>
+    <content hash="9f86d081..." chars="19" pageWidth="646" pageHeight="1123">
+        <p para="0"><r family="Microsoft YaHei" size="14"><![CDATA[普通文字一段。]]></r>
+            <r family="Microsoft YaHei" size="14" weight="700" color="#ffc81e28"><![CDATA[加粗红色]]></r></p>
+        <p para="1"><r family="SimSun" size="28" italic="1" underline="single"><![CDATA[换字体的一段]]></r></p>
+    </content>
 </tripaDocument>
 ```
 
@@ -447,23 +491,41 @@ Ctrl+D 作用在这几种字上时是这样的（判据在 `distortionEffectKind
 | `wave/term` | 噪声波的分量 | 幅度/频率/相位逐条存；读回来就是**同一条波形** |
 | `blocks/block` | 段落格式 | `para` = 段落序号（从 0 起），对齐/缩进/段前段后/行距 |
 | `runs/run` | 手写 / 扭曲 / 随机字体 | 按**字符区间**记（`start` 含、`end` 不含），同一效果的连续字符合成一段 |
-| `content` | 正文本身 | Qt 的 HTML（`QTextDocument::toHtml()`），字体/字号/粗斜下划线/前景色都在里面；`hash` 是正文的 SHA-256，`pageWidth/pageHeight` 是断行宽度 |
+| `content/p` | 一个段落 | `para` = 段落序号（和 `<blocks>` 对得上）；段内是若干 `<r>` |
+| `content/p/r` | 一段同格式文本 | 文本在 CDATA 里**原样**存；格式写成属性（见下表） |
+
+`<r>` 上的字符格式属性（没写的 = 没有那个属性，不是"等于默认值"）：
+
+| 属性 | 对应 | 说明 |
+| --- | --- | --- |
+| `family` | `FontFamilies` | 多个候选字体用逗号分隔 |
+| `size` / `pixelSize` | `FontPointSize` / `FontPixelSize` | 磅值 / 像素值，二选一 |
+| `weight` | `FontWeight` | 100–900（`700` = 粗体） |
+| `italic` `strikeOut` | `FontItalic` / `FontStrikeOut` | `1` 表示生效 |
+| `underline` | `TextUnderlineStyle` | `none/single/dash/dot/dashDot/dashDotDot/wave/spellCheck` |
+| `valign` | `TextVerticalAlignment` | `normal/sub/super` |
+| `color` / `bg` | 前景 / 背景画刷 | 一律 `#aarrggbb` 八位，半透明也一字不差 |
 
 几个设计上的取舍：
 
-* **正文交给 Qt 的 HTML**，不自己发明一套字符格式的 xml：`toHtml()` / `setHtml()`
-  本来就是自洽的一对，往返之后文字、逐字格式、连 fragment 的切分都一致。
-  塞在 CDATA 里既不转义也不损失精度，文件还看得懂。
-* **但 HTML 有两个坑，所以有三样东西单独存**（都是实测出来的）：
-  1. Qt 导 HTML 时把长度值**四舍五入到整像素**（`margin-top:9.5px` 出去、回来
-     变成 `10px`），所以段落格式另存一份 `<blocks>`；
-  2. `setHtml()` **不会**把 `<body style="font-size:14pt">` 装回文档的默认字体
-     （实测在新建的 `QTextDocument` 上仍然是应用默认的 9pt），所以默认字体
-     另存一份 `<font>`，装完正文再 `setDefaultFont()`；
-  3. 正文栏宽度（`pageSize()`）不属于 HTML，不存的话重开之后文档宽度是
-     "没设过"，一行能排到天边、断行全变，所以记在 `content` 的属性上。
+* **正文是纯文本 + 属性，不嵌 HTML**（format version 2 起的改动，也是这次的重点）：
+  以前 `content` 里躺着一整份 `QTextDocument::toHtml()` 的 `<html><head><style>…`，
+  一个排版工具自己的文档格式里塞一坨 HTML，既不好读也不好改 —— 而且它带来三个坑，
+  逼着我们在旁边又另存了三样东西（段落格式、默认字体、栏宽）。现在一个 `<p>`/`<r>`
+  就说完的事不再绕道 HTML：文字原样进 CDATA，格式写在属性上。
+* **每个 `<r>` 都把字体写全**（连"没显式设过字体"的那些字也按文档默认字体写出来）：
+  这样文件是**自足**的 —— 换台机器、换个默认字体打开，排版不会变；
+  代价是纯文字的 `<r>` 上也带着 `family`/`size` 两个属性（README 就是宁可选这个）。
+* **相邻同格式的片段要合并**：`QTextFragment` 是**按字符**存的（实测 19 个字就是
+  19 个 fragment，哪怕格式一模一样），所以扫描时必须自己按"看得见的属性"合并 ——
+  否则一次全选改字号会在文件里留下成百上千个 `<r>`。比较时**不能**直接用
+  `QTextCharFormat::operator==`：它比的是整张属性表，里面含 Qt 内部的
+  `ObjectIndex`（和显示效果无关，同一格式插到不同 fragment 上可能不同），
+  拿它比会合并不掉（踩过：6 个字变成 6 个 `<r>`）。
+* **段落格式仍然单独存一份 `<blocks>`**：`<p>` 里只放文字和字符格式，
+  对齐/缩进/行距/段前段后按**段落序号**记在 `<blocks>` 里，段落序号两边都能对上。
 * **效果按字符位置存**，因为手写/扭曲本来就是"一个字符一个效果"，而且它们
-  不进 `QTextDocument` 的排版（见 5. 实现要点），HTML 里根本没有它们的位置。
+  不进 `QTextDocument` 的排版（见 5. 实现要点），正文里根本没有它们的位置。
   位置一旦被改过（有人直接编辑 xml 正文）就会张冠李戴，所以 `content` 上带了
   正文的 **SHA-256**：对不上就**不套效果**，并明确告诉你"效果没恢复，重新应用一次即可"。
 * **波形存分量而不是只存种子**：`NoiseWave::reseed()` 用 `QRandomGenerator(seed)`
@@ -472,11 +534,15 @@ Ctrl+D 作用在这几种字上时是这样的（判据在 `distortionEffectKind
 * **写入是原子的**（`QSaveFile`）：写一半被打断，磁盘上要么是旧的完整文件、要么是新的。
 * **解析一律宽容**：不认识的元素/属性跳过、数值越界钳住、坏的效果区间丢掉，
   缺 `<page>` / `<font>` / `<blocks>` / 波形也照样能读（缺的那些保留调用方当前的值）。
+* **老文件照样能打开**：`version="1"` 的 `.tripa` 里 `content` 装的是一段 HTML 的 CDATA，
+  读取端认这个老写法（`<p>`/`<r>` 一个都没有时才走 HTML 分支），只是**不再往那个格式里写**。
+  存回去就自动升级成 version 2 了。
 
 > **自检到哪一步**：`tests/test_document.cpp`（`test_document.exe`）把
 > "文档 → xml → 文档"逐项比对 —— 正文、逐字符格式、段落格式、效果区间、
-> 页面设置、渲染参数、波形逐点、**渲染结果逐像素**，再加上一份真写到磁盘再读回来。
-> 当前全部通过（约 40 项）。
+> 页面设置、渲染参数、波形逐点、**渲染结果逐像素**，再加上一份真写到磁盘再读回来；
+> 另有一组专门盯"正文不许是 HTML"（`<p>`/`<r>` 结构、同格式合并、属性正确、
+> 文件里不许出现 `<html>` / `qt-*`）。当前 90 项全部通过。
 
 ---
 
@@ -564,6 +630,7 @@ python tools\make_icon.py             # 重新生成程序图标
 | `proofsheet.*` | 手写数据校对表（含缺字清单） |
 | `baselineadjust.*` | 逐字基线/大小调整对话框 + 同名 xml 的读写入口 |
 | `tripadocument.*` | `.tripa` 文档格式：正文 + 排版 + 效果 + 页面设置 的 xml 读写（见 2.9） |
+| `tripa.rc` / `icons/tripa.ico` | Windows 可执行文件自己的图标 + 版本信息（资源管理器 / 快捷方式读的是它，见第 5 节） |
 | `main.cpp` | 程序入口 + 统一的分页渲染（PNG/PDF/打印共用）+ 自检入口 |
 
 几个关键取舍：
@@ -595,11 +662,15 @@ python tools\make_icon.py             # 重新生成程序图标
 鼠标也必须点得准。为此有七个容易踩的坑，都在 `texteditor.*`
 和 `effectsrenderer.cpp` 里标注了，改动时别破坏：
 
-1. **换行宽度必须显式钉在正文宽度上。**
+1. **换行宽度必须显式钉在正文宽度上，分页高度必须钉在纸高上。**
    `QTextEdit` 默认的 `LineWrapMode::WidgetWidth` 会**忽略** `document()->pageSize()`，
    直接按 viewport 宽度断行。纸张居中后 viewport 比正文区宽得多，
    于是断行位置和打印结果不一致。所以 `applyLayoutMetrics()` 里两件事一起做：
-   `document()->setPageSize(正文尺寸)` + `setLineWrapColumnOrWidth(正文宽度)`。
+   `document()->setPageSize(QSizeF(正文宽, 纸高))` + `setLineWrapColumnOrWidth(正文宽度)`。
+
+   > **分页高度是纸高，不是正文区高** —— 这一条是分页模型的地基，
+   > 设错了会"每页都重画一遍文档开头"，一页装满再缩放还会直接崩（见 2.6.1）。
+   > 正文区之外的上下留白由绘制时的 `setClipRect` 保证，不靠分页高度去挤。
 
 2. **纸张居中量只能由"编辑区宽度"算，绝不能读 `viewport()->width()`。**
    居中量是拿去做 `setViewportMargins(pad, 0, 0, 0)` 的，于是
@@ -759,11 +830,40 @@ python tools\make_icon.py             # 重新生成程序图标
   > 一次是"只数深色像素"把桌面底色 `#3a3d42` 也算成墨；
   > 一次是拿来比的图根本不是"关效果"那张，于是"新墨 0 个"报了假警。
 
-> 量测的坑：`QWidget::grab()` 对**子控件**是把控件画在**父控件坐标系**里再截的，
-> 不是控件局部坐标。曾经拿 viewport 的 grab 当"viewport 内的位置"用，
-> 整段测量凭空平移了一个纸张居中量，于是得出了错的结论。
-> 现在统一在**窗口坐标**里量，并且扫描范围卡在纸面以内
-> （紧挨着纸右边的竖滚动条是整条深色，扫进去会把包围盒拉歪）。
+> 量测的坑（两个，都是拿"读起来对"的写法踩出来的）：
+>
+> * `QWidget::grab()` 对**子控件**是把控件画在**父控件坐标系**里再截的，
+>   不是控件局部坐标。曾经拿 viewport 的 grab 当"viewport 内的位置"用，
+>   整段测量凭空平移了一个纸张居中量，于是得出了错的结论。
+>   现在统一在**窗口坐标**里量，并且扫描范围卡在纸面以内
+>   （紧挨着纸右边的竖滚动条是整条深色，扫进去会把包围盒拉歪）。
+> * `window.grab()` 在**改了状态之后**不可靠：它拿的是子控件**当前后备存储**里的
+>   内容，而 `QApplication::processEvents()` 并不保证绘制已经发生 ——
+>   于是"滚动到第 2 页之后截的图"其实还是滚动之前那一帧
+>   （实测：纸是新的、纸上的字和光标还是旧的，查了半天"正文没跟着纸走"）。
+>   要量**编辑区**里的东西（纸、正文、光标、效果层），一律用
+>   `editor->viewport()->grab()`，并且在改动状态之后先 `viewport()->repaint()`
+>   强制一次同步绘制（`--uitest` 里的 `settle()` 就是干这个的）。
+
+### 程序图标为什么要嵌进 exe
+
+`QApplication::setWindowIcon()`（`main.cpp`）只管**窗口左上角、任务栏、Alt+Tab 列表**。
+**资源管理器里的文件图标、文件属性的"图标"、快捷方式默认取的图标，读的是 exe 自己的
+`RT_GROUP_ICON` 资源** —— 那是链接器写进去的，Qt 运行时一点忙都帮不上。
+所以只设 `setWindowIcon` 的话，exe 在资源管理器里就是一个白板默认图标。
+
+于是有两份图标、两条路：
+
+| 文件 | 谁用 | 怎么进去 |
+| --- | --- | --- |
+| `icons/tripa.png` | Qt 运行时（窗口、任务栏） | `resources.qrc` → `:/icons/tripa.png` |
+| `icons/tripa.ico` | Windows（资源管理器、快捷方式） | `tripa.rc` → windres/rc 编成对象一起链接 |
+
+`icons/tripa.ico` 是**多尺寸**的（16/24/32/48/64/128/256，每档一张 PNG，
+`tools/make_icon.py` 里按面积平均缩小生成）—— 只放一张 256 的话，
+小图标视图下会被资源管理器糊成一团。`tripa.rc` 里那条 `ICON` 写的是
+**相对 `.rc` 文件所在目录**的路径（`icons\tripa.ico`），windres 是按自己的
+当前目录找的，所以手工构建时要先 `cd` 到仓库根（见 `tools/build-manual.ps1`）。
 
 ---
 
@@ -793,6 +893,12 @@ python tools\make_icon.py             # 重新生成程序图标
 * **横向滚动条是关着的**，横向平移只有 Shift+滚轮 / 触控板的横向滚动
   （值我们用，条子不显示：让它可见的话 Qt 会按"文档宽度"接管横向范围，
   而我们按"纸张宽度"设，两者不一样）。放大到纸比窗口宽时靠 Shift+滚轮挪。
+* **分页是"内容通到底、纸一张张往下排"**，不是"一页写满就逼你翻页"：
+  文档里没有真正的分页符（`QTextBlockFormat` 的"段前分页"也只是排版属性），
+  页与页之间在屏幕上就是连续的纸。想强制从新的一页开始，目前只能手动加空段落。
+* **`window.grab()` 抓不到刚改过的子控件状态**（见第 5 节末尾那段说明）。
+  自己的截图/量测代码要点：改完状态先 `viewport()->repaint()`，
+  或者干脆别 grab 窗口、直接 grab viewport。
 * **一个 CSV 一整页字**（`train/handwrite*.csv` 那种）时，第 1 行的标签是**识别结果**：
   只要识别结果和实际写的字在某个位置差了一个（识别漏字、多认一个字、你手动改过标签），
   从那里往后的槽位就会整体错位一格 —— 校对表和基线调整对话框的预览都能看出来

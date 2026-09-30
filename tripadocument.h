@@ -18,21 +18,28 @@ class QTextDocument;
  * `.tripa` 把这些一起写进一个 xml 里（见文件头部的注释与 README 第 2.9 节）。
  *
  * 分层：
- *   - 文字本身 + 逐字的富文本格式（字体/字号/粗斜下划线/前景色）交给 Qt 的
- *     HTML 序列化（`QTextDocument::toHtml()` / `setHtml()`），它本来就是
- *     自洽的 xml，嵌在 `<content>` 的 CDATA 里既不转义也不损失精度；
+ *   - 文字本身 + 逐字的富文本格式（字体/字号/粗斜下划线/颜色）写成
+ *     `<content>` 下的 `<p>`（段落）/ `<r>`（一段同格式文本），
+ *     文本原样放在 CDATA 里、格式写成属性 —— **不嵌 HTML**；
+ *   - 段落格式（对齐/缩进/行距…）按段落序号记在 `<blocks>` 里；
  *   - 手写 / 扭曲这类"不进排版、只改怎么画"的效果存在
- *     `QTextCharFormat` 的自定义属性里，HTML 序列化**不认识**它们，
+ *     `QTextCharFormat` 的自定义属性里，正文里根本没有它们，
  *     所以单独写成 `<effects>` 下的若干 `<run>`（按字符位置区间存）；
  *   - 页面设置、噪声波、渲染参数、显示开关各写一段。
  *
  * 读文件一律"宽容解析"：不认识的元素/属性直接跳过，
  * 数值越界钳住，坏掉的段落单独报出来 —— xml 是文本文件，谁都能手改。
+ * version 1 的老文件（`<content>` 里是一段 HTML 的 CDATA）照样读得进来。
  */
 namespace tripadoc {
 
-//! 文件里记的格式版本（写死的当前版本）
-constexpr int kFormatVersion = 1;
+/*!
+ * 文件里记的格式版本。
+ *
+ * 1 -> 2：正文从"嵌一段 Qt 导出的 HTML"改成"纯文本 + 属性"（`<p>` / `<r>`）。
+ * 读的时候两个版本都认，写的时候一律写 2。
+ */
+constexpr int kFormatVersion = 2;
 
 //! 根元素名，用来判断"这是不是一个 tripa 文档"
 extern const char *const kRootElement;

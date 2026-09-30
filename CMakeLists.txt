@@ -47,6 +47,15 @@ set(PROJECT_SOURCES
         resources.qrc
 )
 
+# ---------------------------------------------------------------- 程序图标（Windows）
+# exe **自己**要带一份图标资源，否则资源管理器 / Alt+Tab 里显示的是默认白板图标
+# （QApplication::setWindowIcon() 只管窗口左上角和任务栏，管不到 exe 的文件图标）。
+# MSVC 认 .rc，MinGW 会自动调 windres —— 两边都不用额外配置，加进源文件即可。
+# 资源里引用的图标写成 "icons\\tripa.ico"（相对 .rc 所在的目录，也就是本文件旁边）。
+if(WIN32)
+    list(APPEND PROJECT_SOURCES tripa.rc)
+endif()
+
 if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     qt_add_executable(tripa
         MANUAL_FINALIZATION
