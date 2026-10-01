@@ -1,0 +1,51 @@
+/*
+ * Windows 可执行文件自己的资源：图标 + 版本信息。
+ *
+ * 为什么必须有这个文件：
+ *   `QApplication::setWindowIcon()`（见 main.cpp）只管**窗口左上角和任务栏**，
+ *   它是在进程起来之后由 Qt 设给窗口的。
+ *   **资源管理器 / Alt+Tab / 文件列表里显示的图标是 exe 自己的 RT_GROUP_ICON 资源** ——
+ *   那一段只有链接器写进去才有，Qt 运行时一点忙都帮不上。
+ *   所以缺了它，exe 在资源管理器里就是一个白板默认图标。
+ *
+ * 图标必须是**多尺寸**的（icons/tripa.ico 里放了 16/24/32/48/64/128/256），
+ * 资源管理器会按当前视图（小图标/大图标/超大图标）挑合适的那一张。
+ *
+ * 这一份是 Win32 资源脚本，不参与 C++ 编译；两个构建路径都要带上它：
+ *   - CMake：Windows 上自动用 windres / rc 编译（见 CMakeLists.txt）；
+ *   - tools/build-manual.ps1：手工调 windres 编成 .o 再一起链接。
+ */
+
+#include <windows.h>
+
+IDI_TRIPA ICON "icons\\tripa.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    0,4,0,0
+ PRODUCTVERSION 0,4,0,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        /* 0804 = 简体中文，04b0 = Unicode */
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "tripa"
+            VALUE "FileDescription",  "tripa 排版工具"
+            VALUE "FileVersion",      "0.4.0.0"
+            VALUE "InternalName",     "tripa"
+            VALUE "LegalCopyright",   "tripa"
+            VALUE "OriginalFilename", "tripa.exe"
+            VALUE "ProductName",      "tripa"
+            VALUE "ProductVersion",   "0.4.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

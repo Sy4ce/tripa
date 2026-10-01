@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(tripa VERSION 0.2 LANGUAGES CXX)
+project(tripa VERSION 0.4 LANGUAGES CXX)
 
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -22,10 +22,22 @@ set(PROJECT_SOURCES
         main.cpp
         mainwindow.cpp
         mainwindow.h
+        # 渲染层：按需分页（纸张几何全在这里，文档里没有纸的概念）
+        paginatinglayout.cpp
+        paginatinglayout.h
         texteditor.cpp
         texteditor.h
+        # 富文本层：正文 + 逐字格式 + 手写/抖动数据 + 段落字行边距（不管分页）
+        richdocument.cpp
+        richdocument.h
         effectsrenderer.cpp
         effectsrenderer.h
+        # 效果层的计算层：显示表缓存 + 几何分片算（与绘制解耦）
+        effectplanner.cpp
+        effectplanner.h
+        # 长活儿的分片调度 + 进度（状态栏进度条就靠它）
+        jobrunner.cpp
+        jobrunner.h
         handwriting.cpp
         handwriting.h
         noise.cpp
@@ -44,6 +56,8 @@ set(PROJECT_SOURCES
         baselineadjust.h
         tripadocument.cpp
         tripadocument.h
+        tripalog.cpp
+        tripalog.h
         resources.qrc
 )
 
@@ -70,7 +84,7 @@ else()
     add_executable(tripa ${PROJECT_SOURCES})
     qt5_create_translation(QM_FILES ${CMAKE_CURRENT_SOURCE_DIR} ${TS_FILES})
     add_dependencies(tripa ${QM_FILES})
-    target_link_libraries(tripa PRIVATE Qt5::Widgets Qt5::PrintSupport)
+    target_link_libraries(tripa PRIVATE Qt6::Widgets Qt6::PrintSupport)
 endif()
 
 if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
@@ -145,4 +159,87 @@ target_link_libraries(test_document PRIVATE
 )
 if(MSVC)
     target_compile_options(test_document PRIVATE /utf-8)
+endif()
+
+# ---------------------------------------------------------------- 分页排版自检
+# 渲染层的几何：按需分页、一行都不越下边界、每一页只有自己那一段内容、
+# 滚动下边界的定义、命中测试与光标的往返。
+# 跑法: cmake --build build --target test_layout && ./build/test_layout.exe
+add_executable(test_layout
+    tests/test_layout.cpp
+    paginatinglayout.cpp
+    richdocument.cpp
+    pagesetup.cpp
+    paragraph.cpp
+    tripadocument.cpp
+    # paginatinglayout / richdocument 里的 TRIPA_* 宏最终走到这里
+    tripalog.cpp
+    handwriting.cpp
+    noise.cpp
+    effect.cpp
+)
+target_include_directories(test_layout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_layout PRIVATE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Gui
+    # pagesetup.cpp 的 applyToPrinter() 用了 QPrinter（打印支持模块）
+    Qt${QT_VERSION_MAJOR}::PrintSupport
+)
+if(MSVC)
+    target_compile_options(test_layout PRIVATE /utf-8)
+endif()
+
+# ---------------------------------------------------------------- 长活儿 / 计算层自检
+# 分片调度（真的让出事件循环了吗、进度单调吗、取消干净吗）、
+# 以及效果显示表的按段落惰性计算、"算好才挖洞"。
+# 跑法: cmake --build build --target test_jobs && ./build/test_jobs.exe
+add_executable(test_jobs
+    tests/test_jobs.cpp
+    jobrunner.cpp
+    effectplanner.cpp
+    effectsrenderer.cpp
+    paginatinglayout.cpp
+    richdocument.cpp
+    pagesetup.cpp
+    paragraph.cpp
+    handwriting.cpp
+    noise.cpp
+    effect.cpp
+    tripalog.cpp
+)
+target_include_directories(test_jobs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_jobs PRIVATE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Gui
+    Qt${QT_VERSION_MAJOR}::PrintSupport
+)
+if(MSVC)
+    target_compile_options(test_jobs PRIVATE /utf-8)
+endif()
+
+# ---------------------------------------------------------------- 性能基准（不是"通过/失败"）
+# 量清楚"加噪声"这条路上每一步各花多久：逐字写格式 / 规划显示表 / 算字形几何 /
+# 绘制一次。这些数字是 2.6.2 那套"算的归算、画的归画"的依据 ——
+# 以后要把什么挪出绘制路径，先跑它，别拍脑袋。
+# 跑法: cmake --build build --target bench_effects && ./build/bench_effects.exe [字数]
+add_executable(bench_effects
+    tests/bench_effects.cpp
+    effectsrenderer.cpp
+    paginatinglayout.cpp
+    richdocument.cpp
+    pagesetup.cpp
+    paragraph.cpp
+    handwriting.cpp
+    noise.cpp
+    effect.cpp
+    tripalog.cpp
+)
+target_include_directories(bench_effects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bench_effects PRIVATE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Gui
+    Qt${QT_VERSION_MAJOR}::PrintSupport
+)
+if(MSVC)
+    target_compile_options(bench_effects PRIVATE /utf-8)
 endif()

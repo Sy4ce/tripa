@@ -13,6 +13,20 @@ class QSpinBox;
 class QTabWidget;
 
 /*!
+ * \brief `QTextBlockFormat` 里**没有**对应字段的两项段落属性。
+ *
+ * "段前分页"和"与下段同页"正好是 `QTextFormat::PageBreak_AlwaysBefore` /
+ * `PageBreak_AlwaysAfter`；"段中不分页"和"孤行控制"在 Qt 里没有位置，
+ * 但它们是**富文本层要存的东西**（段落属性，跟页码无关），
+ * 所以用 QTextFormat 的自定义属性存 —— 这样存盘（.tripa 存的是段落格式）
+ * 和撤销重做都自动跟着走，不需要第二套存储。
+ */
+namespace tripaformat {
+constexpr int kKeepLinesTogether = QTextFormat::UserProperty + 0x51; //!< 段中不分页
+constexpr int kWidowControl = QTextFormat::UserProperty + 0x52;      //!< 孤行控制
+} // namespace tripaformat
+
+/*!
  * \brief 段落格式：缩进、间距、换行分页、中文版式。
  *
  * 对应 Word「段落」对话框的三个选项卡。所有字段都直接映射到 QTextBlockFormat，

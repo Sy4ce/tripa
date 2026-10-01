@@ -5,6 +5,7 @@
 
 #include <QColor>
 #include <QFont>
+#include <QPainterPath>
 #include <QPair>
 #include <QPointF>
 #include <QRectF>
@@ -109,9 +110,53 @@ struct EffectRenderOptions
  * 选区背景照旧由 PaintContext::selections 铺在下面。
  * 于是"隐藏原字"和"显示选区"两件事不再互相打架，也不需要任何底色。
  */
+/*!
+ * \brief 一个字符**算好了的**可绘制几何。
+ *
+ * 这是"计算"和"渲染"之间的那道界线。以前 `renderEffects()` 每画一帧都要：
+ *   - 对手写笔迹逐点做坐标换算、按噪声重采样（`distortPolyline`）、再滑动平均平滑；
+ *   - 对扭曲字形查轮廓、按包围盒排序、拼成填充路径（`buildGlyphPath`）。
+ * 全篇两千个字，光这些就 50ms 一帧（冷缓存 585ms），而且发生在 `paintEvent` 里 ——
+ * 屏幕上就是"一滚动就顿"。
+ *
+ * 现在这些几何在**后台任务**里算好（见 effectplanner.h），存进这个结构，
+ * 绘制时只做"查表 + 落笔"。
+ *
+ * 坐标口径：
+ *   - 扭曲层：`fillPath` 是**本地坐标**（基线在原点、y 向下），落笔位置是 `origin`；
+ *   - 手写层：`strokes` 直接就是**文档坐标**（origin 留着是为了将来统一）。
+ */
+struct PreparedChar
+{
+    //! 几何算好了、可以画
+    bool ready = false;
+    //! 手写数据缺失（画不出来）—— 绘制时会记进 options.missing
+    bool missingData = false;
+
+    //! 扭曲层：整字的填充路径（外形和洞一起交给奇偶规则）
+    QPainterPath fillPath;
+    //! 扭曲层：本路径的落笔原点（文档坐标）
+    QPointF origin;
+
+    //! 手写层：逐笔画折线（文档坐标）
+    QVector<QVector<QPointF>> strokes;
+    /*!
+     * 手写层：与 `strokes` 一一对应的笔压（0..1，负数 = 该点没有笔压）。
+     *
+     * 存的为什么是**笔压**而不是线宽：线宽还要乘上"笔宽"系数（工具栏上能调），
+     * 存线宽的话用户每动一下滑块就得把所有几何重算一遍 —— 存笔压就不用。
+     */
+    QVector<QVector<double>> strokePressure;
+    //! 没有笔压时用的兜底线宽（文档单位）
+    double fallbackStrokeWidth = 1.0;
+    //! 笔压 0 也不能画成 0 宽（圆头笔帽画不出 0 宽的线，笔画会断口）
+    double minStrokeWidth = 0.35;
+};
+
 struct EffectDrawItem
 {
     int position = 0;   //!< 字符在文档里的位置
+    QChar character;    //!< 这个字符本身（算几何、画的时候都靠它，不用再回文档里查）
     QRectF charRect;    //!< 文档坐标下的占位矩形
     QFont font;
     BaselineScale fit;  //!< 基线 + 磅->文档单位的比例
@@ -121,12 +166,23 @@ struct EffectDrawItem
     QColor foreground;
     bool hasForeground = false;
     /*!
-     * 这一格的原字要不要藏起来（会被效果整格替换掉）。
+     * 这一格的原字**该不该**被效果整格替换掉（计划阶段算出来的意图）。
+     *
+     * 跟 `hidden` 分开：意图在计划阶段就知道，而"真的要挖洞"还要等几何算好 ——
+     * 几何没好就先挖洞，屏幕上会出现"原字没了、新字也没来"的空窗。
+     */
+    bool replaceIntent = false;
+    /*!
+     * 这一格的原字**真的**要挖掉（= replaceIntent 且几何已经算好）。
      *
      * 调用方据此挖洞裁剪 —— 屏幕、打印、导出必须都按这一个标志来，
      * 各自再判断一遍"什么情况算替换"迟早会不一致。
      */
     bool hidden = false;
+    //! 几何算过了吗（算过但 ready 为假 = 这个字算不出来，别再算第二次）
+    bool geometryDone = false;
+    //! 算好的几何（渲染只读）
+    PreparedChar art;
 };
 
 /*!
@@ -138,6 +194,49 @@ struct EffectDrawItem
 QVector<EffectDrawItem> planEffects(const QTextDocument *document,
                                     const EffectRenderOptions &options,
                                     QVector<QPair<int, int>> *hiddenRanges = nullptr);
+
+/*!
+ * \brief 只要**一个段落**的绘制计划（计算层的按需单位）。
+ *
+ * 全篇一次的 `planEffects()` 在交互式绘制里是不能用的：它每帧都走一遍全文，
+ * 稿子越长每帧越慢（实测 2000 字 5ms、20000 字就 50ms），而且效果层一次绘制
+ * 会被调**两遍**（挖洞一遍、画效果一遍）。分段算 + 缓存（见 effectplanner.h）
+ * 之后，一帧的代价只跟"看得见的那几段"有关。
+ */
+QVector<EffectDrawItem> planEffectsForBlock(const QTextDocument *document,
+                                            const QTextBlock &block,
+                                            const EffectRenderOptions &options,
+                                            QVector<QPair<int, int>> *hiddenRanges = nullptr);
+
+/*!
+ * 把整批项算成可绘制几何（**同步**，给打印 / 导出 / 自检用）。
+ *
+ * 交互式绘制**不要**用它：它会把这一批全算完才返回（实测 2000 字 585ms）。
+ * 交互式路径是 effectplanner.h 里那条"分片算 + 进度条"的路。
+ */
+void prepareEffects(QVector<EffectDrawItem> *items, const EffectRenderOptions &options);
+/*!
+ * \brief 把一个计划项算成"可以直接画"的几何（**这就是那个慢的计算**）。
+ *
+ * 幂等：同样的参数算多少遍结果都一样（贵的部分另外有全局缓存）。
+ * 后台任务调它，绘制路径**不调**；缺数据的字符把 `art.missingData` 置位，
+ * 调用方拿去填 `options.missing`。
+ */
+void prepareEffectItem(EffectDrawItem *item, const EffectRenderOptions &options);
+
+//! 画一个已经算好的项（没算好就什么都不画）
+void drawEffectItem(QPainter *painter,
+                    const EffectDrawItem &item,
+                    const EffectRenderOptions &options);
+
+/*!
+ * \brief 把一批**已经算好**的项画出来 —— 这就是渲染层的全部工作。
+ *
+ * 不查表、不算几何、不分配：只落笔。
+ */
+void renderPreparedEffects(QPainter *painter,
+                           const QVector<EffectDrawItem> &items,
+                           const EffectRenderOptions &options);
 
 /*!
  * \brief 把一个手写样本画到目标位置上。

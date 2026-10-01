@@ -762,6 +762,17 @@ void writePageSetup(QXmlStreamWriter &xml, const PageSetup &setup)
     xml.writeAttribute(QStringLiteral("orientation"),
                        setup.landscape ? QStringLiteral("landscape")
                                        : QStringLiteral("portrait"));
+    /*!
+     * 页眉页脚：**默认不写**（不写 = 不显示）。
+     * 只写开关和文字，不写“第 N 页”这类渲染结果 ——
+     * 页数会随内容变，写进文件就错了。
+     */
+    if (setup.headerEnabled)
+        xml.writeAttribute(QStringLiteral("header"), setup.headerText);
+    if (setup.footerEnabled)
+        xml.writeAttribute(QStringLiteral("footer"), setup.footerText);
+    if (setup.chromeFontSizePt > 0.1)
+        xml.writeAttribute(QStringLiteral("chromePt"), num(setup.chromeFontSizePt));
     xml.writeStartElement(QStringLiteral("margins"));
     xml.writeAttribute(QStringLiteral("leftMm"), num(setup.marginLeftMm));
     xml.writeAttribute(QStringLiteral("topMm"), num(setup.marginTopMm));
@@ -782,6 +793,17 @@ void readPageSetup(const QXmlStreamAttributes &attrs, PageSetup *setup)
         setup->landscape =
             attrs.value(QStringLiteral("orientation")).toString() == QLatin1String("landscape");
     }
+    /*! 页眉页脚：老文件里根本没有这两个属性，读回来就是“不显示”（默认关） */
+    if (attrs.hasAttribute(QStringLiteral("header"))) {
+        setup->headerEnabled = true;
+        setup->headerText = attrs.value(QStringLiteral("header")).toString();
+    }
+    if (attrs.hasAttribute(QStringLiteral("footer"))) {
+        setup->footerEnabled = true;
+        setup->footerText = attrs.value(QStringLiteral("footer")).toString();
+    }
+    setup->chromeFontSizePt =
+        clampedAttr(attrs, QStringLiteral("chromePt"), setup->chromeFontSizePt, 4.0, 72.0);
 }
 
 void readMargins(const QXmlStreamAttributes &attrs, PageSetup *setup)

@@ -2,23 +2,38 @@
 #define TEXTEDITOR_H
 
 #include "effectsrenderer.h"
+#include "effectplanner.h"
 #include "pagesetup.h"
+#include "paginatinglayout.h"
 
 #include <QElapsedTimer>
 #include <QTextEdit>
 #include <QTransform>
 
 class QPainter;
+class QTimer;
+
+class RichDocument;
 
 /*!
- * \brief 所见即所得的排版编辑区。
+ * \brief 所见即所得的排版编辑区（**视图层**）。
  *
- * 版面约定（很重要，打印和导出的对齐都依赖它）：
- *   - 文档（QTextDocument）只有"正文"那么大：pageSize = 纸张 - 页边距，
- *     documentMargin = 0，所以文档坐标 (0,0) 就是第一页正文区的左上角；
- *   - 第 n 页的正文区左上角在文档坐标 (0, n * 纸张高度)；
- *   - 纸面、阴影、居中位置全部在这里自己画，viewport 不填色，
- *     这样深色主题下纸张依然是白纸黑字。
+ * 三层各管一件事，界线要清楚：
+ *
+ *   - **富文本层**（richdocument.h）：正文 + 格式 + 手写/抖动数据 + 段落的字行边距。
+ *     它不知道纸有多大，也不知道"页"是什么；
+ *   - **渲染层**（paginatinglayout.h）：按需分页。文字只往正文窗口里填，
+ *     填不下就整行换页；没写到的地方就没有页；
+ *   - **视图层**（本文件）：缩放、滚动、绘制（纸 + 正文 + 效果 + 光标）、
+ *     鼠标/键盘。**它不改版面数字** —— 比例尺只是"屏幕上多大"。
+ *
+ * 坐标口径（三层之间唯一的接口，记错一个就是"字画在一处、点哪儿都不对"）：
+ *
+ *   - **文档坐标 = 纸面坐标**：第 p 页的纸是
+ *     `[p*纸高, (p+1)*纸高) × [0, 纸宽]`，正文窗口由渲染层算；
+ *   - **viewport 坐标** = 文档坐标 × 缩放 + 纸面原点（纸面原点里含滚动量）；
+ *   - 两者之间只有一个变换：`documentToViewport()`。
+ *     正文、光标、选区、效果层、鼠标命中共用它的正/逆变换。
  *
  * 手写 / 扭曲效果**和正文在同一次 paintEvent 里画**（不是独立的透明子控件）：
  * 一次绘制里只有一套坐标，屏幕、抓图、打印、导出走的是同一段代码。
@@ -36,7 +51,7 @@ public:
      * 和 .tripa 里存的任何数字都不跟着变 —— 在排版软件里比例尺是**视图属性**，
      * 不是文档属性（换个比例尺不该让文件内容变一个字节）。
      * 实现上是给绘制和命中测试共用那一个变换乘一个比例，
-     * 文档布局仍然是 100% 那一套，所以"屏幕上看的样子"和"纸上印的样子"
+     * 分页仍然是 100% 那一套，所以"屏幕上看的样子"和"纸上印的样子"
      * 只差一个放大倍数。
      */
     static constexpr double kZoomMin = 0.25;
@@ -51,12 +66,38 @@ public:
     void zoomBy(double delta, const QPointF &viewportAnchor);
     double zoom() const { return m_zoom; }
 
+    // ---------------------------------------------------------------- 两层
+
+    //! 富文本层：正文 + 格式 + 效果数据 + 段落字行边距（**没有**任何纸张概念）
+    RichDocument *richDocument() const { return m_rich; }
+    //! 渲染层：分页排版（纸张几何、每行落在哪一页、命中测试）
+    PaginatingLayout *layout() const { return m_layout; }
+    /*!
+     * 效果层的**计算层**：显示表缓存 + 待算队列（见 effectplanner.h）。
+     *
+     * 视图只读它、只排队，**不算几何** —— "渲染"与"计算"的分界线就在这里。
+     * 主窗口拿它去开后台任务（`EffectWorkJob`）。
+     */
+    EffectPlanner *effectPlanner() const { return m_planner; }
+
+    //! 当前一共几页（**按需分页**的结果：没写到的页根本不存在）
+    int pageCount() const;
+    //! 视图下边界（文档坐标）= 最后一页下边界 + 一页高：滚到底能把最后一页顶到视窗最上面
+    double contentBottomPx() const;
+
+    //! 段落里的"字边距"（字距，百分比）—— 走富文本层，这里只是顺手转一下
+    void setParagraphCharSpacing(double percent);
+
+    // ---------------------------------------------------------------- 版面
+
     void setPageSetup(const PageSetup &setup);
     const PageSetup &pageSetup() const { return m_pageSetup; }
+    //! 页眉页脚：默认都不显示；页面设置里开了之后由 setPageSetup() 一起带进来
+    void setPageChrome(const PageChrome &chrome);
 
     //! 正文区在第一页里的左上角偏移（像素，96dpi）
     QPointF bodyOriginPx() const;
-    //! 一张纸在文档坐标里的矩形（原点在第一页左上角；文档口径，不含缩放）
+    //! 一张纸在文档坐标里的矩形（文档坐标原点就是第一页纸的左上角）
     QRectF pageRectInDocument() const;
 
     //! 100% 下的纸张尺寸（文档 / 打印口径）；屏幕上的尺寸要乘缩放，见下面两个
@@ -77,11 +118,11 @@ public:
     //! 给竖滚动条预留的宽度（居中量里减掉的就是它，诊断用）
     int scrollBarReservePx() const;
 
-    //! 文档坐标 -> viewport 坐标（滚动 + 纸张居中 + 正文页边距）
+    //! 文档坐标 -> viewport 坐标（**唯一**的坐标变换：平移 + 缩放）
     QTransform documentToViewport() const;
-    //! 第一页正文区左上角在 viewport 里的位置
+    //! 第一页正文区左上角在 viewport 里的位置（诊断 / 自检用）
     QPointF documentOriginInViewport() const;
-    //! 第 page 页正文区原点相对第一页的偏移（文档坐标）
+    //! 第 page 页正文区左上角在**文档坐标**里的位置
     QPointF pageTopLeft(int page) const;
 
     //! viewport 局部坐标（= QMouseEvent::pos()）-> 文档坐标下的光标
@@ -105,7 +146,27 @@ public:
 
 public slots:
     void updateOverlayGeometry();
-    void updateScrollRange();
+    /*!
+     * 重算滚动范围与纸张居中量。
+     *
+     * \a source 只用来**诊断**（日志里会带上"是谁调进来的"）：
+     * 这个函数一旦被高频调用就是活锁，而"谁在调"是唯一能定位它的线索。
+     */
+    void updateScrollRange(const QString &source = QStringLiteral("直接调用"));
+
+    /*!
+     * \brief 把"版面要重算"这件事排到事件循环的下一轮（同轮内多次请求只算一次）。
+     *
+     * 为什么必须延迟：`updateScrollRange()` 会改 viewport 边距，而 viewport
+     * 尺寸一变就会重排、重排又会发 `documentSizeChanged` ——
+     * 直接把那个信号连到 `updateScrollRange()` 就是一个自激环，
+     * **实测一秒里调用 3704 次、界面彻底卡死**（自检 soak 组用日志抓出来的）。
+     * 延迟一轮 + 合并重复请求之后，每轮最多算一次，环就断了。
+     *
+     * 需要"立刻生效"的地方（鼠标命中、缩放锚点、自检）仍然直接调
+     * `updateScrollRange()` —— 那条路是同步的、不带环。
+     */
+    void scheduleLayoutUpdate();
     /*!
      * 把光标滚进可视区，用**视图像素**算。
      *
@@ -118,6 +179,20 @@ public slots:
      * （见 --uitest 的 pagefix：边打边量，视口跟着光标走）。
      */
     void ensureCaretVisible();
+    /*!
+     * \brief 任务正在改文档时把重画压住。
+     *
+     * 为什么必须有这个开关（实测出来的，见 --uitest progress）：
+     * 给一千多个字套效果时，每一片都会让文档变一次 —— 而视图只要重画一次，
+     * 就会重新规划看得见的那几段、并要求重算它们的字形几何（几百个字）。
+     * 结果是一个正反馈：**改一点 -> 重画 -> 重算几百个字的几何 -> 再改一点**。
+     * 实测这项操作本来只要 0.4 秒，开着重画跑了 **30 秒**。
+     *
+     * 压住之后：改的这段时间屏幕上保持原样（状态栏的进度条一直在走），
+     * 改完一次性重画 —— 用户看到的就是"一眨眼，效果好了"。
+     */
+    void setRepaintsDeferred(bool deferred);
+    bool repaintsDeferred() const { return m_repaintsDeferred; }
 
     /*!
      * 鼠标处理放在 public 是有意的：自检（--uitest）需要直接驱动这三个入口
@@ -140,35 +215,45 @@ signals:
     void effectsVisibilityChanged(bool visible);
     //! 缩放变了（1.0 = 100%）；状态栏的缩放控件据此同步
     void zoomChanged(double zoom);
-
+    //! 页数变了（状态栏"第 x/y 页"用它）
+    void pageCountChanged(int pages);
+    /*!
+     * 有字形几何等着算（滚动到新的一页、刚套完效果）。
+     *
+     * 视图**不自己算**：它把这件事交给主窗口的 `JobRunner`，
+     * 由后者分片做完并把进度显示在状态栏上。
+     */
+    void effectWorkNeeded();
 protected:
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void scrollContentsBy(int dx, int dy) override;
+    void focusInEvent(QFocusEvent *event) override;
 
 private:
-    //! 把正文宽高钉到页面设置上（pageSize + 换行宽度），纸张/窗口变化都走这里
+    //! 把页面设置换算成渲染层的版面几何（纸张 / 页边距 / 页眉页脚）
     void applyLayoutMetrics();
     //! 自己画光标竖条（Qt 的光标可见性状态在私有类里，拿不到）
-    void drawCaret(QPainter *painter, const QPointF &docOrigin);
-    /*!
-     * 光标矩形，**文档坐标**。
-     *
-     * 不要直接用 `QTextEdit::cursorRect()`：它给的是"文档坐标 **减掉滚动量**"
-     * （实测：文档 y=130 的光标在滚动 200 之后返回 -70）。
-     * 滚动量为 0 时两者一样，所以"没滚动过"的场合看不出问题 ——
-     * 一旦滚下去，照它画的光标就会整体再上移一个滚动量，
-     * 屏幕上直接看不见（这正是它一直在干的事）。
-     */
-    QRect caretRectInDocument() const;
+    void drawCaret(QPainter *painter);
+    //! 光标在**文档坐标**里的矩形（几何来自渲染层的行落点）
+    QRectF caretRectInDocument() const;
     //! 缩放的真正实现：改比例、重算滚动范围，再把锚点那一格摆回原处
     void applyZoom(double zoom, const QPointF &viewportAnchor);
+    //! 光标闪烁：相位由自己维护（见构造函数里的说明）
+    void restartCaretBlink();
+
+    RichDocument *m_rich = nullptr;
+    PaginatingLayout *m_layout = nullptr;
+    EffectPlanner *m_planner = nullptr;
 
     PageSetup m_pageSetup;
     EffectRenderOptions m_options;
     bool m_effectsVisible = true;
     //! 视图缩放，1.0 = 100%
     double m_zoom = 1.0;
+    //! 光标当前这一相是不是"亮"（闪烁由 QTimer 驱动，见 restartCaretBlink）
+    bool m_caretVisible = true;
+    QTimer *m_caretTimer = nullptr;
     //! 是否正在按住左键拖选
     bool m_dragSelecting = false;
     /*!
@@ -181,9 +266,18 @@ private:
      *     这就是"起点和终点永远在一行的开始或末尾、不能选到中间就停"。
      */
     int m_dragAnchor = 0;
-    //! 连击计数：2 = 双击选词，3 = 三击选段
+    //! 拖选时用的连击计数
     int m_clickChain = 0;
     QElapsedTimer m_clickClock;
+    //! `scheduleLayoutUpdate()` 已经排过一次了吗（合并同一轮里的重复请求）
+    bool m_layoutUpdatePending = false;
+    //! 任务正在改文档：暂停重画（见 setRepaintsDeferred）
+    bool m_repaintsDeferred = false;
+    /*!
+     * 最近一秒里 `updateScrollRange()` 都是谁调进来的（诊断活锁用）。
+     * 触发源包括：布局信号、内容变化、设页面、缩放、窗口尺寸、光标定位、外部直接调用。
+     */
+    QStringList m_rangeCallSources;
 };
 
 #endif // TEXTEDITOR_H

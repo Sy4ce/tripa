@@ -1,10 +1,14 @@
 #include "texteditor.h"
 
 #include "effectsrenderer.h"
+#include "richdocument.h"
+#include "tripalog.h"
 
 #include <QAbstractTextDocumentLayout>
 #include <QApplication>
+#include <QDateTime>
 #include <QFile>
+#include <QFocusEvent>
 #include <QFontMetricsF>
 #include <QKeyEvent>
 #include <QPainter>
@@ -15,7 +19,11 @@
 #include <QTextBlock>
 #include <QTextDocument>
 #include <QTextLayout>
+#include <QTimer>
 #include <QWheelEvent>
+
+#include <cmath>
+#include <numeric>
 
 namespace {
 
@@ -29,11 +37,63 @@ namespace {
  */
 const QColor kDeskColor(0x3a, 0x3d, 0x42);
 
+/*!
+ * 绘制里的日志节流：`paintEvent` 一秒能跑几百次，**每次绘制只打一行**，
+ * 而且只在"页范围或几何真的变了"时打。
+ *
+ * 这一条对排查"后几页又出现同样的字"是关键的：只要把每页的
+ * 纸面矩形 / 正文窗口 / 文档尺寸一起记下来，一眼就能看出
+ * "第 2 页那个窗口里到底装的是文档的哪一段"。
+ */
+struct PaintLogState
+{
+    quint64 serial = 0;
+    int firstPage = -1;
+    int lastPage = -1;
+    qint64 lastDocHeight = -1;
+    int lastScroll = -1;
+    int lastZoomPercent = -1;
+};
+PaintLogState g_paintLog;
+
 } // namespace
 
 TextEditor::TextEditor(QWidget *parent)
     : QTextEdit(parent)
+    , m_rich(new RichDocument(this))
 {
+    /*!
+     * 三层就位：富文本层先建好，渲染层的**分页排版**装到它的文档上，
+     * 最后控件挂到这个文档上。顺序不能反 —— QTextEdit 一旦先拿到别的文档，
+     * 就会按"连续排版"那套算一遍几何，白算一次，而且很容易忘了再装回来。
+     */
+    setDocument(m_rich->text());
+    /*!
+     * `QTextEdit::setDocument()` 会不会顺手换掉文档布局，是 Qt 的实现细节。
+     * `installPaginatingLayout()` 是幂等的（文档上已经是分页排版就原样返回），
+     * 所以这里再确认一次：不确认的话，某天 Qt 换了行为，
+     * 症状就是"分页又回到一页复制一页"，而且极难查。
+     */
+    m_layout = installPaginatingLayout(m_rich->text());
+    m_layout->setTitle(tr("未命名"));
+
+    /*!
+     * 计算层就位（effectplanner.h）。它只依赖上面两层，不看任何控件状态 ——
+     * 所以自检里可以抛开窗口单独驱动它。
+     *
+     * 两个信号的分工：
+     *   - `planChanged`：又算好了一批格子 -> 重画（一次一片，不会被信号淹）；
+     *   - `workPending`：有活等着算 -> 转给主窗口的 JobRunner 分片做，
+     *     进度显示在状态栏上。控件自己**不**在这里算任何几何。
+     */
+    m_planner = new EffectPlanner(m_rich->text(), m_layout, this);
+    connect(m_planner, &EffectPlanner::planChanged, this, [this] {
+        viewport()->update();
+    });
+    connect(m_planner, &EffectPlanner::workPending, this, [this] {
+        emit effectWorkNeeded();
+    });
+
     // 纸张、桌面底色、阴影全部自己画。
     // 关键：QTextEdit 默认会用调色板把整个 viewport 填一遍，那样在深色主题下
     // 白色的纸面会被盖成灰色，所以这里既关掉 viewport 的自动填充，
@@ -64,6 +124,24 @@ TextEditor::TextEditor(QWidget *parent)
      * 所以别的地方不要随手去写它。
      */
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    /*!
+     * 竖滚动条**常驻**（`ScrollBarAlwaysOn`），不许 Qt 按需显示/隐藏。
+     *
+     * 这是踩出来的活锁，症状是"打字/缩放时界面卡死、CPU 满"：
+     * 竖滚动条的显隐会改变 viewport 宽度（14 像素），而 viewport 一变尺寸
+     * 就会重排；重排之后 Qt（`_q_adjustScrollbars`）按**文档尺寸**重算我们
+     * 精心设好的滚动范围，于是"该不该显示滚动条"又被判成另一个答案 ——
+     * 实测宽度在 **1110 <-> 1096** 之间来回跳，一秒 130 多次 resize
+     * （日志里 `TextEditor 一秒里 resize 了 133 次` 就是它），
+     * 每个来回还各自跑一遍排版 + 绘制。
+     *
+     * 常驻之后这条反馈通路就断了。顺带还解决两件事：
+     *   - `paperPadPx()` 里减掉的那个"滚动条预留宽度"终于**真的**恒等于
+     *     实际占位，纸张居中不会再因为滚动条冒出来而跳一下；
+     *   - 光标定位、滚动范围不再受"当前有没有滚动条"影响。
+     * 代价只是在内容很短时右边也有一条滚动条 —— 排版软件里这很正常。
+     */
+    setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
 
     QPalette pal = palette();
     for (QPalette::ColorGroup group : {QPalette::Active, QPalette::Inactive}) {
@@ -105,22 +183,75 @@ TextEditor::TextEditor(QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
     setCursorWidth(2);
 
-    connect(document()->documentLayout(), &QAbstractTextDocumentLayout::documentSizeChanged,
-            this, &TextEditor::updateScrollRange);
+    /*!
+     * 版面相关的回调**一律排在事件循环的下一轮**（见 `scheduleLayoutUpdate()`），
+     * 不能在这里直接连到 `updateScrollRange()`。
+     *
+     * 原因（这是实测出来的活锁，不是假想）：`updateScrollRange()` 里会
+     * `setViewportMargins()` 改 viewport 尺寸，而 viewport 变尺寸又会触发
+     * 重排、重排又发 `documentSizeChanged` —— 直接相连就成了自激环：
+     * 实测一秒里被调了 **3704 次**、界面完全卡死（日志里那条 WARN 就是它）。
+     * 排到下一轮 + 合并重复请求之后，每轮最多算一次，环自然断开。
+     */
+    connect(m_layout, &PaginatingLayout::layoutRebuilt, this, &TextEditor::scheduleLayoutUpdate);
+    connect(m_layout, &QAbstractTextDocumentLayout::documentSizeChanged, this,
+            &TextEditor::scheduleLayoutUpdate);
+    connect(m_layout, &PaginatingLayout::pageCountChanged, this, &TextEditor::pageCountChanged);
+    //! 文档级格式变了（默认字体、换行规则）：断行结果会变，整篇重新断行
+    connect(m_rich, &RichDocument::globalFormatChanged, this, [this] {
+        m_layout->invalidateAll();
+        if (m_planner)
+            m_planner->invalidateAll(); // 字宽/行高变了：格子和基线全变
+        scheduleLayoutUpdate();
+        viewport()->update();
+    });
     // 内容变了要重算滚动范围（页数变了），画面也要重画
-    connect(document(), &QTextDocument::contentsChanged, this, [this] {
-        updateScrollRange();
+    connect(m_rich, &RichDocument::contentChanged, this, [this] {
+        scheduleLayoutUpdate();
         viewport()->update();
     });
 
-    //! 闪烁：借用 QTextEdit 自己的闪烁定时器相位（它在暗相位会把
-    //! cursorRect() 置空），所以这里只要保证光标被画出来就行。
-    connect(this, &QTextEdit::cursorPositionChanged, this, [this] {
+    /*!
+     * 光标闪烁自己维护相位。
+     *
+     * 以前是借 QTextEdit 自己的闪烁定时器（它在暗相位让 `cursorRect()` 返回空矩形），
+     * 但光标矩形现在由渲染层算（`PaginatingLayout::caretRect()`）——
+     * 它只回答"光标在文档坐标的哪儿"，不回答"这一相该不该显示"。
+     * 相位是纯视图的事，自己拿着反而更简单，也更好测
+     * （`QApplication::setCursorFlashTime(0)` = 不闪，自检就是这么量的）。
+     */
+    m_caretTimer = new QTimer(this);
+    connect(m_caretTimer, &QTimer::timeout, this, [this] {
+        m_caretVisible = !m_caretVisible;
         viewport()->update();
     });
+    connect(this, &QTextEdit::cursorPositionChanged, this, [this] {
+        restartCaretBlink();
+        viewport()->update();
+    });
+    restartCaretBlink();
 
     setPageSetup(m_pageSetup);
     setEffectsVisible(false);
+}
+
+//! 光标闪烁：亮一相、暗一相，节奏跟系统设置一致
+void TextEditor::restartCaretBlink()
+{
+    m_caretVisible = true;
+    const int flash = QApplication::cursorFlashTime();
+    if (flash <= 0) {
+        m_caretTimer->stop(); // 系统里关了闪烁（自检也会这么设）：一直亮着
+        return;
+    }
+    m_caretTimer->start(qMax(100, flash / 2));
+}
+
+void TextEditor::focusInEvent(QFocusEvent *event)
+{
+    QTextEdit::focusInEvent(event);
+    restartCaretBlink();
+    viewport()->update();
 }
 
 // ---------------------------------------------------------------- 版面几何
@@ -192,46 +323,55 @@ QRectF TextEditor::pageRectInDocument() const
 }
 
 /*!
- * 文档坐标 -> viewport 坐标。**正文、光标、选区、效果层
- * 四者必须共用这一个变换。**
+ * 文档坐标 -> viewport 坐标。**正文、光标、选区、效果层、
+ * 鼠标命中五者必须共用这一个变换。**
  *
- * 内容边距（纸张居中量）已经由 setViewportMargins 消化掉了 ——
- * viewport 原点的 x 本身就是纸张左边缘，所以这里只剩两段：
+ * 文档坐标就是**纸面坐标**（第 p 页的纸在文档坐标里是
+ * `[p*纸高, (p+1)*纸高) × [0, 纸宽]`），纸张居中量已经由
+ * setViewportMargins 消化掉了 —— viewport 原点的 x 就是纸张左边缘。
+ * 所以这里只剩两件事：
  *
- *   1. 页边距 bodyOriginPx()：文档坐标以"第一页正文区左上角"为原点，
- *      而 QTextEdit 眼里的"内容原点"是 viewport 原点。
- *   2. 滚动量。
+ *   1. 缩放（比例尺是**视图属性**，改它不动文档里任何一个数字）；
+ *   2. 滚动量（paperOriginInViewport() 里那个负号）。
  *
- * 反过来（viewport -> 文档坐标）也是同一套：
- *   QTextEditPrivate::mapToContents() 算的是
- *   "viewport 坐标 - viewport 边距 + 滚动值"，
- *   在"内容原点 = 文档原点 - 页边距"的前提下正好和这个变换互逆。
- * 两套不能对不上，否则就是"字画在一处、光标画在另一处、点哪儿都不对"。
+ * 于是整篇只有一个仿射变换：**屏幕 = 文档 × 缩放 - 滚动量**。
+ * 分页完全是文档坐标里的事（页与页之间隔着上下边距，见 paginatinglayout.h），
+ * 所以"第几页"根本不需要出现在这里 —— 这正是把分页从视图里赶出去的好处：
+ * 命中测试就是这个变换的逆变换，不可能出现"字画在一处、点哪儿都不对"。
  */
 QTransform TextEditor::documentToViewport() const
 {
-    const QPointF origin = documentOriginInViewport();
+    const QPointF paper = paperOriginInViewport();
     /*!
-     * 缩放和原点合成**一个**变换交给所有调用方：正文、光标、选区、鼠标命中、
-     * 效果层全用它（6 个参数直接写出来，比 translate()/scale() 连写更不容易
-     * 搞错顺序：m11 = m22 = 缩放，dx/dy = 原点）。
+     * 缩放和原点合成**一个**变换交给所有调用方（6 个参数直接写出来，
+     * 比 translate()/scale() 连写更不容易搞错顺序：
+     * m11 = m22 = 缩放，dx/dy = 纸面原点）。
      * 逆变换就是"视口坐标 -> 文档坐标"，命中测试也走它。
      */
-    return QTransform(m_zoom, 0.0, 0.0, m_zoom, origin.x(), origin.y());
+    return QTransform(m_zoom, 0.0, 0.0, m_zoom, paper.x(), paper.y());
 }
 
-//! 第一页正文区左上角在 viewport 里的位置（当前滚动量下）
+/*!
+ * \brief 文档坐标的原点（**第一页纸的左上角**）在 viewport 里的位置。
+ *
+ * 口径提醒：文档坐标的原点是**纸的左上角**，不是正文的左上角 ——
+ * 正文区左上角 = 这个点 + 页边距 × 缩放（用的是 bodyOriginPx()）。
+ *
+ * 这个点同时就是本控件唯一那个坐标变换的原点
+ * （documentToViewport = 先平移到它、再乘缩放），所以
+ * `documentOriginInViewport() + 文档坐标 × 缩放` 永远是屏幕位置 ——
+ * 自检里很多处都是这么算的，把原点定在纸角，那些公式就不用改。
+ */
 QPointF TextEditor::documentOriginInViewport() const
 {
-    const QPointF body = bodyOriginPx();
-    const QPointF paper = paperOriginInViewport();
-    return QPointF(paper.x() + body.x() * m_zoom, paper.y() + body.y() * m_zoom);
+    return paperOriginInViewport();
 }
 
-//! 第 \a page 页正文区原点相对第一页的偏移（文档坐标）
+//! 第 \a page 页正文区左上角在**文档坐标**里的位置
 QPointF TextEditor::pageTopLeft(int page) const
 {
-    return QPointF(0.0, page * paperHeightPx());
+    const QPointF body = bodyOriginPx();
+    return QPointF(body.x(), page * paperHeightPx() + body.y());
 }
 
 /*!
@@ -376,31 +516,115 @@ void TextEditor::mouseReleaseEvent(QMouseEvent *event)
  *     （见 paperPadPx），viewport 宽度不参与 —— 否则"边距改宽度、
  *     宽度改边距"会互相推挤到死循环。纸张比剩下空间还宽时才启用水平滚动兜底。
  */
-void TextEditor::updateScrollRange()
+void TextEditor::updateScrollRange(const QString &source)
 {
-    const QSizeF content = document()->size();
-    const double paperHeight = paperHeightPx();
+    /*!
+     * 重入诊断：这个函数是从 `documentSizeChanged` / `contentsChanged` /
+     * `resizeEvent` 里回调进来的，而它自己又会去 `setViewportMargins`
+     * （= 改 viewport 尺寸 = 触发 resizeEvent / 重排）。
+     * 一旦环闭不上，就是"一秒几百次"的活锁 —— 从外面看是**界面卡死**，
+     * 用户报告里那句"打字/缩放时容易卡死或崩"就有它一份。
+     *
+     * 这里只报告不拦截（拦截会把真正的调用漏掉），日志里连续冒出同一行就说明中了。
+     */
+    static int callDepth = 0;
+    static int callCount = 0;
+    static qint64 lastReportMs = -1;
+    static QVector<int> history; //!< 前几秒的调用次数（用来判断"突然暴涨"）
+    ++callDepth;
+    ++callCount;
+    if (m_rangeCallSources.size() < 12)
+        m_rangeCallSources.append(source);
+    struct Guard
+    {
+        int *depth;
+        explicit Guard(int *d)
+            : depth(d)
+        {
+        }
+        ~Guard() { --*depth; }
+    } guard(&callDepth);
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (lastReportMs < 0 || nowMs - lastReportMs > 1000) {
+        /*!
+         * 判"活锁"要看两件事，只看绝对值会误报：
+         *
+         *   - **绝对上限 500 次/秒**：正常操作一秒也就几十次
+         *     （打字、缩放、拉窗口都会触发重排 + 滚动范围重算，
+         *      自检 soak 组里正常峰值约 50 次/秒），而真正卡死的活锁是
+         *     每秒几百到几千次；
+         *   - **相对暴涨**：比前 3 秒的均值高 10 倍以上也要报 ——
+         *     那种"没有卡死但一直在自喂"的软环，绝对值可能只有一两百，
+         *     但它会让界面明显发顿，正是用户嘴里的"用一会儿就不对劲"。
+         */
+        /*!
+         * 判据只有一条：**绝对上限 500 次/秒**。
+         *
+         * 试过再加一条"比前 3 秒均值高 10 倍就报"，结果全是误报 ——
+         * 快速连按 Ctrl+滚轮、拖状态栏滑块本来就是"一秒钟几十次"的爆发型操作
+         * （实测自检 soak 组里 44 次/秒就被报了）。而真正的活锁是
+         * **每秒几百到几千次**（踩到的那次是 3704 次/秒），
+         * 跟正常操作的量级差着两个数量级，绝对值就够了。
+         */
+        if (callCount > 500) {
+            TRIPA_WARN("layout",
+                       QStringLiteral("updateScrollRange 一秒里被调了 %1 次（递归深度 %2）—— "
+                                      "多半是「改边距 -> viewport 变尺寸 -> 重排 -> 再改边距」"
+                                      "绕成了环。视口=%3x%4 左边距=%5 滚动范围=%6..%7 "
+                                      "文档高=%8 缩放=%9 来源=[%10]")
+                           .arg(callCount)
+                           .arg(callDepth)
+                           .arg(viewport()->width())
+                           .arg(viewport()->height())
+                           .arg(viewportMargins().left())
+                           .arg(verticalScrollBar()->minimum())
+                           .arg(verticalScrollBar()->maximum())
+                           .arg(m_layout->documentSize().height(), 0, 'f', 1)
+                           .arg(m_zoom, 0, 'f', 3)
+                           .arg(m_rangeCallSources.join(QLatin1Char(','))));
+        }
+        history.append(callCount);
+        while (history.size() > 3)
+            history.removeFirst();
+        callCount = 0;
+        m_rangeCallSources.clear();
+        lastReportMs = nowMs;
+    }
 
     /*!
-     * 滚动范围钉在**整张纸**上（不是"正文一连串排下来"那个高度），
-     * 而且用 `paperHeight * 页数` 算，不再"正文高 + 上下边距"——
-     * 后者在 `pageSize` = 纸高之后就等于前者，两个都留着迟早会不一致。
-     */
-    const int pages = qMax(1, int(std::ceil(content.height() / qMax(1.0, paperHeight))));
-    const double totalHeight = paperHeight * pages * m_zoom;
-    /*!
-     * 上限再收一道：**正文的最后一行要能停在视口底边**。
+     * 滚动范围 = **视图下边界** - 视口高度。
      *
-     * 只按整张纸算的话，一页正文装到纸高一半时，滚到底会看到"页面底部
-     * 那一大片空白"——用户会觉得"滚过头了，纸下面还有一截看不见的东西"
-     * （实测：滚到底时视口里一个字都没有）。收到"最后一行贴底"就自然了。
+     * 视图下边界的定义在渲染层（`PaginatingLayout::contentBottomPx()`）：
+     * **最后一页的下边界 + 一页高**。用户要的就是这个 ——
+     * 滚到底时能把最后一页的下边界顶到视窗最上面，
+     * 底下那一截是桌面（没有内容），一眼能看出"写到哪儿了"。
+     *
+     * 文档坐标 × 缩放 = 视图像素，而滚动值本身就是视图像素
+     * （paperOriginInViewport() 里那个负号），所以换算只有一次乘法。
      */
-    const double contentEnd = (bodyOriginPx().y() + content.height()) * m_zoom;
-    const int maxByContent = int(std::ceil(contentEnd)) - viewport()->height();
-    verticalScrollBar()->setRange(0, qMax(0, qMin(int(std::ceil(totalHeight))
-                                                      - viewport()->height(),
-                                                  maxByContent)));
+    const double contentBottom = m_layout->contentBottomPx() * m_zoom;
+
+    /*!
+     * 滚动范围**只在真的变了**时才改，而且改之前记一条日志。
+     * 这个函数是从 `documentSizeChanged` / `contentsChanged` 里回调进来的，
+     * 一旦它反过来又改了文档尺寸，就会自己喂自己 —— 那种死循环
+     * 从外面看就是"打字/缩放时随机卡死或崩"，日志里会留下一串
+     * 时间戳挨得极近的调用，一眼能认出来。
+     */
+    const int newMaximum = qMax(0, int(std::ceil(contentBottom)) - viewport()->height());
     verticalScrollBar()->setPageStep(viewport()->height());
+    if (newMaximum != verticalScrollBar()->maximum()) {
+        TRIPA_DEBUG("layout",
+                    QStringLiteral("滚动范围 %1 -> %2（页数=%3 视图下边界=%4 缩放=%5 视口高=%6）")
+                        .arg(verticalScrollBar()->maximum())
+                        .arg(newMaximum)
+                        .arg(m_layout->pageCount())
+                        .arg(contentBottom, 0, 'f', 1)
+                        .arg(m_zoom, 0, 'f', 3)
+                        .arg(viewport()->height()));
+    }
+    verticalScrollBar()->setRange(0, newMaximum);
 
     const int pad = int(std::lround(paperPadPx()));
     const int paper = int(std::ceil(paperViewWidthPx()));
@@ -421,39 +645,63 @@ void TextEditor::updatePageMargins()
 }
 
 /*!
- * 版面尺寸的铁律：
- *   QTextEdit 默认的 LineWrapMode::WidgetWidth 会**忽略** document()->pageSize()，
- *   直接按 viewport 宽度断行。纸张居中之后 viewport 比正文区宽得多，
- *   所以必须显式把换行宽度钉在"正文宽度"上，断行位置才等于打印时的断行位置。
- *   两处都要设：document()->setPageSize() 决定分页高度，换行宽度决定每行长度。
+ * 把"版面要重算"排到下一轮。见头文件里的说明：直接相连会绕成
+ * "改边距 -> viewport 变尺寸 -> 重排 -> 又发 documentSizeChanged" 的
+ * 自激环（实测一秒 3704 次、界面卡死）。
+ */
+void TextEditor::scheduleLayoutUpdate()
+{
+    if (m_layoutUpdatePending)
+        return;
+    m_layoutUpdatePending = true;
+    QTimer::singleShot(0, this, [this] {
+        m_layoutUpdatePending = false;
+        updateScrollRange(QStringLiteral("延迟的版面更新"));
+    });
+}
+
+/*!
+ * 版面几何的交接点：**页面设置 -> 渲染层**。
  *
- * **分页高度 = 整张纸的高度，不是正文区的高度。**
+ * 这里只做一件事：把纸张、页边距、页眉页脚换算成渲染层的输入
+ * （RenderMetrics / PageChrome），然后由渲染层重排。
  *
- * 这一点是整个分页模型的地基，写错过一次、症状很吓人：
- *   - 设成正文区高度时，文档高度是"正文一连串地排下来"，
- *     而屏幕上每张纸的正文区是隔一个**纸高**放一个的 ——
- *     两者对不上，第 n 页的窗口里出现的其实是"文档里隔了一个下边距的那一段"，
- *     于是第 2 页起内容在纸上的位置整体偏移，还会**越过下边距**；
- *     正文一页装不下就更加离谱：同一份内容会在后面每一页上原样重来一遍
- *     （用户看到的"后三页内容完全一样，还多出几个蓝色虚线框"就是这个）。
- *   - 设成纸高之后，"第 n 页正文区" = 文档里第 n 个纸高那一段 + 上边距，
- *     和屏幕上纸的位置**逐页对齐**，一页一份内容，四边页边距一律有效。
+ * 视图**不再往文档里塞纸高**。以前这里有一句
+ * `document()->setPageSize(QSizeF(正文宽, 纸高))`，那是两个 bug 的病根：
+ * 文档一旦知道自己的纸有多大，分页就变成了"内容连续排下来 + 每页裁一个
+ * 正文窗口"——
+ *   - 每张纸的窗口里装的都是**文档开头那一段**（第二页重复第一页的字）；
+ *   - 越过正文区下边界的字不会跑到下一页，它们落在下边距里被裁掉
+ *     （写着写着出下边界）。
+ * 现在分页全在渲染层（paginatinglayout.h），纸的尺寸不再进文档。
  *
- * 上下都不留白要靠绘制时的裁剪：正文只画在 [上边距, 上边距+正文高) 里
- * （见 paintEvent），所以下边距也永远不会有字。
+ * 断行宽度仍然要落在文档上（`setLineWrapColumnOrWidth`）：段落对话框、
+ * .tripa 的兼容字段都会读 `document()->pageSize().width()`，而这个值
+ * 必须**等于渲染层断行用的正文宽度** —— 两处不一致就是
+ * "屏幕上断行位置和纸上不一样"。
  */
 void TextEditor::applyLayoutMetrics()
 {
-    const QSizeF body = m_pageSetup.bodySizePx();
-    const double paperHeight = paperHeightPx();
+    const RenderMetrics metrics = RenderMetrics::fromPageSetup(m_pageSetup);
+    TRIPA_SCOPE(tripalog::Level::Trace, "layout", QStringLiteral("applyLayoutMetrics"));
 
     document()->setDocumentMargin(0);
-    document()->setPageSize(QSizeF(body.width(), qMax(body.height(), paperHeight)));
-
     setLineWrapMode(QTextEdit::FixedPixelWidth);
-    setLineWrapColumnOrWidth(int(std::lround(body.width())));
+    setLineWrapColumnOrWidth(int(std::lround(metrics.bodyWidthPx())));
 
-    updateScrollRange();
+    m_layout->setMetrics(metrics); // 纸张 / 边距变了 -> 整篇重新断行 + 分页
+    m_layout->setChrome(PageChrome::fromPageSetup(m_pageSetup));
+
+    TRIPA_DEBUG("layout",
+                QStringLiteral("应用版面：正文 %1x%2，纸 %3x%4，缩放=%5，页数=%6")
+                    .arg(metrics.bodyWidthPx(), 0, 'f', 1)
+                    .arg(metrics.bodyHeightPx(), 0, 'f', 1)
+                    .arg(metrics.paperWidthPx, 0, 'f', 1)
+                    .arg(metrics.paperHeightPx, 0, 'f', 1)
+                    .arg(m_zoom, 0, 'f', 3)
+                    .arg(m_layout->pageCount()));
+
+    updateScrollRange(QStringLiteral("applyLayoutMetrics"));
     viewport()->update();
 }
 
@@ -463,6 +711,43 @@ void TextEditor::setPageSetup(const PageSetup &setup)
 {
     m_pageSetup = setup;
     applyLayoutMetrics();
+}
+
+/*!
+ * \brief 页眉页脚（默认都不显示）。
+ *
+ * 只改渲染层的装饰，**不动任何行的位置** —— 页眉画在上边距里、
+ * 页脚画在下边距里，那是纸上的空白，正文窗口一个像素也不会被占。
+ * 于是"开不开页眉"永远不会让文字重排（这一点很重要：
+ * 排版一变，用户看到的断行位置就变了，那才是真的烦）。
+ */
+void TextEditor::setPageChrome(const PageChrome &chrome)
+{
+    m_layout->setChrome(chrome);
+    viewport()->update();
+}
+
+//! 当前一共几页（**按需分页**的结果：没写到的页根本不存在）
+int TextEditor::pageCount() const
+{
+    return m_layout ? m_layout->pageCount() : 1;
+}
+
+//! 视图下边界（文档坐标）= 最后一页下边界 + 一页高
+//! ——滚到底时能把最后一页的下边界顶到视窗最上面。
+double TextEditor::contentBottomPx() const
+{
+    return m_layout ? m_layout->contentBottomPx() : 0.0;
+}
+
+//! 字边距（字距，百分比）：走富文本层，改完整篇重新断行（每个字的宽度都变了）
+void TextEditor::setParagraphCharSpacing(double percent)
+{
+    QTextCursor cursor = textCursor();
+    m_rich->setCharSpacingPercent(&cursor, percent);
+    m_layout->invalidateAll();
+    scheduleLayoutUpdate();
+    viewport()->update();
 }
 
 // ---------------------------------------------------------------- 缩放
@@ -505,36 +790,55 @@ void TextEditor::applyZoom(double zoom, const QPointF &viewportAnchor)
      * 横向滚动值恒为 0，纸自己会重新居中。
      */
     const QPointF docAnchor = documentToViewport().inverted().map(viewportAnchor);
+    const int oldZoomPercent = int(std::lround(m_zoom * 100.0));
 
     m_zoom = zoom;
     applyLayoutMetrics(); // 重算滚动范围 + 纸张居中量，顺带重绘
 
     QScrollBar *bar = verticalScrollBar();
-    const double wanted =
-        bodyOriginPx().y() * m_zoom + docAnchor.y() * m_zoom - viewportAnchor.y();
+    /*!
+     * 缩放后把锚点那一格摆回原处：视图像素 = 文档坐标 × 缩放 - 滚动值，
+     * 所以"它还在锚点"就是 `docAnchor.y() * 新缩放 - 滚动值 = 锚点 y`。
+     *
+     * 旧写法里还有一个 `bodyOriginPx().y() * m_zoom` —— 那是"文档原点是
+     * 正文左上角"时代的产物。现在文档原点是**纸的左上角**，
+     * 这一项必须去掉，否则每缩一次纸就整体往下跑一个上边距。
+     */
+    const double wanted = docAnchor.y() * m_zoom - viewportAnchor.y();
     bar->setValue(qBound(bar->minimum(), int(std::lround(wanted)), bar->maximum()));
 
     emit zoomChanged(m_zoom);
     viewport()->update();
+
+    TRIPA_INFO("zoom",
+               QStringLiteral("缩放 %1% -> %2%（纸 %3x%4 视图像素，锚点 %5,%6，滚动 %7/%8）")
+                   .arg(oldZoomPercent)
+                   .arg(int(std::lround(m_zoom * 100.0)))
+                   .arg(paperViewWidthPx(), 0, 'f', 1)
+                   .arg(paperViewHeightPx(), 0, 'f', 1)
+                   .arg(viewportAnchor.x(), 0, 'f', 1)
+                   .arg(viewportAnchor.y(), 0, 'f', 1)
+                   .arg(verticalScrollBar()->value())
+                   .arg(verticalScrollBar()->maximum()));
 }
 
 /*!
  * 光标矩形（**文档坐标**）。
  *
- * `QTextEdit::cursorRect()` 返回的是"文档坐标 - 滚动量"（实测：
- * 文档 y=130 的光标，竖滚动 200 之后返回 -70，正好差一个滚动量；
- * 横滚动 300 时 x 从 0 变成 -300，同一个道理）。
- * 本控件自己的坐标变换是"文档坐标 × 缩放 + 纸面原点"，纸面原点里**已经**含了
- * `-滚动量`，所以照着 cursorRect() 画就会再减一次 —— 滚动之后光标直接跑到纸外面，
- * 屏幕上一个光标都看不到。这里把它加回去，恢复成纯文档坐标，
- * 之后所有地方（画光标、按视图像素滚动）都只有这一套口径。
+ * 几何一律来自渲染层（`PaginatingLayout::caretRect()`）：它算的是
+ * "这一行落在哪一页的哪一点"，所以分页之后光标不可能跑到纸外面 ——
+ * 光标和正文用的是同一份行位置。
+ *
+ * 以前这里是把 `QTextEdit::cursorRect()` 的滚动量加回去（那个接口返回的是
+ * "文档坐标 - 滚动量"，而本控件的纸面原点里已经含了 `-滚动量`，
+ * 照着画就会再减一次，滚动之后屏幕上一个光标都看不到）。
+ * 那套绕圈子的换算现在没有了。
+ *
+ * 闪烁相位**不在**这里体现（那是视图的事，见 m_caretVisible）。
  */
-QRect TextEditor::caretRectInDocument() const
+QRectF TextEditor::caretRectInDocument() const
 {
-    const QRect r = cursorRect();
-    if (r.isEmpty())
-        return r;
-    return r.translated(horizontalScrollBar()->value(), verticalScrollBar()->value());
+    return m_layout->caretRect(textCursor());
 }
 
 /*!
@@ -548,13 +852,13 @@ QRect TextEditor::caretRectInDocument() const
  */
 void TextEditor::ensureCaretVisible()
 {
-    const QRect caret = caretRectInDocument(); // 文档坐标
+    const QRectF caret = caretRectInDocument(); // 文档坐标
     if (caret.isEmpty())
         return;
 
-    const double bodyTop = bodyOriginPx().y();
-    const double top = (bodyTop + caret.top()) * m_zoom;
-    const double bottom = (bodyTop + caret.bottom()) * m_zoom;
+    // 视图像素 = 文档坐标 × 缩放（纸面原点已经在滚动值里了）
+    const double top = caret.top() * m_zoom;
+    const double bottom = caret.bottom() * m_zoom;
 
     QScrollBar *bar = verticalScrollBar();
     const double value = bar->value();
@@ -633,6 +937,13 @@ void TextEditor::wheelEvent(QWheelEvent *event)
 void TextEditor::setEffectOptions(const EffectRenderOptions &options)
 {
     m_options = options;
+    /*!
+     * 选项要告诉计算层：显示哪一层、是否替换、幅度、波数、噪声波 —— 这些一变，
+     * 算好的几何就不是同一个东西了，该扔的扔掉（颜色 / 笔宽不在此列，见
+     * EffectPlanner::setOptions）。
+     */
+    if (m_planner)
+        m_planner->setOptions(options);
     viewport()->update();
 }
 
@@ -647,8 +958,14 @@ void TextEditor::setEffectsVisible(bool visible)
 
 void TextEditor::relayout()
 {
-    document()->markContentsDirty(0, document()->characterCount());
-    updateScrollRange();
+    /*!
+     * "按当前字体重新排版" = 整篇重新断行：字号、字体族、字距一变，
+     * 每个字的宽度都变了，缓存下来的断点全部作废。
+     */
+    m_layout->invalidateAll();
+    if (m_planner)
+        m_planner->invalidateAll(); // 每个字的位置都可能变了，显示表整篇作废
+    updateScrollRange(QStringLiteral("relayout"));
     viewport()->update();
 }
 
@@ -664,30 +981,56 @@ void TextEditor::updateOverlayGeometry()
     viewport()->update();
 }
 
+/*!
+ * 任务正在改文档时把重画压住（见头文件里的说明：不压住就是 0.4 秒变 30 秒）。
+ */
+void TextEditor::setRepaintsDeferred(bool deferred)
+{
+    if (m_repaintsDeferred == deferred)
+        return;
+    m_repaintsDeferred = deferred;
+    // 放开之后补一次重画：压住的这段时间画面保持原样，现在一次性画成新的
+    if (!m_repaintsDeferred)
+        viewport()->update();
+}
+
 // ---------------------------------------------------------------- 绘制
 
 /*!
- * 绘制分三层，**两层用的原点不一样，这是最容易搞错的地方**：
+/*!
+ * 绘制分四步，**所有坐标都是文档坐标**（纸面坐标），
+ * 只在最外面设一次变换（documentToViewport）：
  *
- *   - 纸面：画在 paperOriginInViewport()。纸张居中量已经由 viewport 边距
- *     消化掉了（viewport 原点的 x 就是纸张左边缘），所以这里不能再加
- *     paperPadPx()，否则纸会被推右一个居中量。
- *   - 正文：画在 documentOriginInViewport() = 纸面原点 + 页边距。
- *     QTextEdit 画光标、画选区用的是 documentLayout()->draw() 的原点，
- *     也就是**内容坐标原点**，所以正文必须画在 documentOriginInViewport()，
- *     不能画在纸面原点上，也不能靠 documentToViewport() 之外的任何近似。
+ *   1. 桌面底色（纸外面那一圈）；
+ *   2. 逐页画纸：阴影 -> 白纸 -> 边框 -> 页眉页脚（默认不显示）；
+ *   3. 正文（含选区、挖洞）和手写 / 扭曲效果，裁剪到**可见页的正文窗口**里；
+ *   4. 光标。
  *
- * 光标 / 选区 / 鼠标命中测试全部由 QTextEdit 在"内容坐标"里算，
- * 三个原点一旦不一致，症状就是"字画在一处、光标画在另一处、点哪儿都不对"。
+ * 为什么现在可以“一次画完”：**分页已经在文档坐标里做掉了** ——
+ * 第 p 页的字就落在 `[p*纸高 + 上边距, ...]` 那一段（见 paginatinglayout.h），
+ * 所以“第几页”不再需要第二套原点。
+ *
+ * 以前是每页 `translate` 一个纸高再裁一个正文窗口，而文档内容是**连续**
+ * 排下来的 —— 每页窗口里装的都是文档开头那一段，这就是
+ * “第二页重复第一页的字”；越过正文区下边界的字也只会被裁掉
+ * （“写着写着出下边界”）。两处病根都是“视图自己在做分页”。
  */
 void TextEditor::paintEvent(QPaintEvent *event)
 {
+    /*!
+     * 任务正在改文档的时候不重画（见 setRepaintsDeferred 的说明）。
+     *
+     * 这不是"省一次绘制"，而是断掉一个正反馈：重画 -> 重新规划可见段落
+     * -> 要求重算几百个字的几何 -> …… 实测让 0.4 秒的活跑了 30 秒。
+     */
+    if (m_repaintsDeferred)
+        return;
+
     /*!
      * 注意：这个函数拿到的是 **viewport 的绘制事件**。
      *
      * QAbstractScrollArea 把 viewport 的事件转给控件自己（viewportEvent），
      * 所以 event->rect() 是 viewport 坐标、也只覆盖 viewport ——
-     * 实测事件矩形正好等于 viewport 的尺寸（959x792），而控件是 1110 宽，
      * 纸张左边那条居中留白不在任何一次绘制事件里。
      * 它靠控件自己的背景画刷刷成桌面色（见构造函数里的调色板 + autoFillBackground），
      * 想在这里补刷是刷不到的（试过：控件自己的 painter 画的像素不会出现）。
@@ -695,25 +1038,110 @@ void TextEditor::paintEvent(QPaintEvent *event)
     QPainter painter(viewport());
     painter.setRenderHint(QPainter::Antialiasing, false);
 
-    const double paperW = paperViewWidthPx();
-    const double paperH = paperViewHeightPx();
-    /*!
-     * 正文区尺寸只有一套口径：**文档坐标**（= 100% 的像素数）。
-     * 排版、裁剪、挖洞、效果层、页码位置全用它。
-     * 屏幕上的大小另算（乘 m_zoom），但只出现在"给绘制变换乘一个倍数"那里
-     * ——屏幕上不再需要按"正文区在屏幕上多大"去画任何东西了。
-     */
-    const QSizeF bodyDocSize = m_pageSetup.bodySizePx();
-    const QPointF paperOrigin = paperOriginInViewport();
-    const QPointF docOrigin = documentOriginInViewport();
+    const RenderMetrics metrics = m_layout->metrics();
+    const double paperViewH = paperViewHeightPx();
     const int scrollY = verticalScrollBar()->value();
+    const int pages = m_layout->pageCount();
 
     // 1. 桌面底色
     painter.fillRect(event->rect(), kDeskColor);
 
-    // 2. 逐页画纸：阴影 -> 白纸 -> 正文
-    const int firstPage = qMax(0, int((event->rect().top() + scrollY) / paperH));
-    const int lastPage = int((event->rect().bottom() + scrollY) / paperH);
+    // 2. 这一轮要画哪几页：严格按屏幕上的纸面位置算（纸面高 = 纸高 × 缩放）
+    const double viewTop = event->rect().top() + scrollY;
+    const double viewBottom = event->rect().bottom() + scrollY;
+    const int firstPage = qBound(0, int(std::floor(viewTop / qMax(1.0, paperViewH))), pages - 1);
+    const int lastPage = qBound(0, int(std::floor(viewBottom / qMax(1.0, paperViewH))), pages - 1);
+
+    /*!
+     * 绘制日志（见文件顶部 g_paintLog 的说明）：几何一变就打一行，
+     * 附带“这一轮要画哪几页、它们的正文窗口落在文档的哪一段”。
+     * 排查“后几页又冒出同样的字”时，这几行就是全部证据。
+     */
+    ++g_paintLog.serial;
+    const qint64 docHeight = qint64(m_layout->documentSize().height());
+    const int zoomPercent = int(std::lround(m_zoom * 100.0));
+    const bool geometryChanged = firstPage != g_paintLog.firstPage
+                                 || lastPage != g_paintLog.lastPage
+                                 || docHeight != g_paintLog.lastDocHeight
+                                 || scrollY != g_paintLog.lastScroll
+                                 || zoomPercent != g_paintLog.lastZoomPercent;
+    if (geometryChanged || g_paintLog.serial % 120 == 0) {
+        g_paintLog.firstPage = firstPage;
+        g_paintLog.lastPage = lastPage;
+        g_paintLog.lastDocHeight = docHeight;
+        g_paintLog.lastScroll = scrollY;
+        g_paintLog.lastZoomPercent = zoomPercent;
+        TRIPA_DEBUG("paint",
+                    QStringLiteral("重绘 #%1 区域=%2,%3 %4x%5 滚动=%6/%7 缩放=%8% 页=%9/%10 "
+                                   "页范围=%11..%12 文档=%13x%14 纸=%15x%16")
+                        .arg(g_paintLog.serial)
+                        .arg(event->rect().x())
+                        .arg(event->rect().y())
+                        .arg(event->rect().width())
+                        .arg(event->rect().height())
+                        .arg(scrollY)
+                        .arg(verticalScrollBar()->maximum())
+                        .arg(zoomPercent)
+                        .arg(pages)
+                        .arg(m_layout->lastContentPage() + 1)
+                        .arg(firstPage)
+                        .arg(lastPage)
+                        .arg(m_layout->documentSize().width(), 0, 'f', 1)
+                        .arg(m_layout->documentSize().height(), 0, 'f', 1)
+                        .arg(paperViewWidthPx(), 0, 'f', 1)
+                        .arg(paperViewH, 0, 'f', 1));
+    }
+
+    /*!
+     * **从这里开始全部是文档坐标。**
+     * 一个变换管到底：纸、页眉页脚、正文、效果、光标。
+     * 多设一个原点就多一个“字画在一处、光标在另一处”的机会。
+     */
+    const QTransform docToView = documentToViewport();
+    painter.setTransform(docToView);
+
+    for (int page = firstPage; page <= lastPage; ++page) {
+        const QRectF paper = metrics.paperRect(page);
+        /*!
+         * 面包屑：崩在绘制里时，dump 上会写着“正在画第几页”，
+         * 再配上下面的几何，就能定位到“哪一页、哪一段文档”。
+         */
+        if (page == firstPage || geometryChanged) {
+            const QRectF body = metrics.bodyRect(page);
+            tripalog::breadcrumb(QStringLiteral("paintEvent 画第 %1 页（正文窗口 y=%2..%3）")
+                                     .arg(page + 1)
+                                     .arg(body.top(), 0, 'f', 1)
+                                     .arg(body.bottom(), 0, 'f', 1));
+        }
+        TRIPA_TRACE("paint",
+                    QStringLiteral("第 %1 页 纸面=%2,%3 %4x%5 正文窗口=%6..%7（行 %8 条）")
+                        .arg(page + 1)
+                        .arg(paper.x(), 0, 'f', 1)
+                        .arg(paper.y(), 0, 'f', 1)
+                        .arg(paper.width(), 0, 'f', 1)
+                        .arg(paper.height(), 0, 'f', 1)
+                        .arg(metrics.bodyRect(page).top(), 0, 'f', 1)
+                        .arg(metrics.bodyRect(page).bottom(), 0, 'f', 1)
+                        .arg(m_layout->linesOnPage(page)));
+
+        // 阴影：只在最外侧留一圈，多页之间不重复描边
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(0, 0, 0, 70));
+        painter.drawRect(paper.translated(2.0, 3.0));
+
+        painter.setBrush(Qt::white);
+        // 笔宽 0 = 1 设备像素：纸张边框不跟着缩放变粗
+        painter.setPen(QPen(QColor(0x8a, 0x8d, 0x92), 0));
+        painter.drawRect(paper);
+
+        /*!
+         * 页眉页脚：**默认都不显示**，在页面设置里可以开（`PageChrome`）。
+         * 它们画在纸的上下边距里，占不到正文窗口，所以开不开都不会
+         * 让文字重排。老版本在这里无条件写“第 N 页”——
+         * 那不是页脚，那是把纸边距当成垃圾桶。
+         */
+        m_layout->drawChrome(&painter, page, palette());
+    }
 
     QAbstractTextDocumentLayout::PaintContext context;
     context.palette = palette();
@@ -722,25 +1150,22 @@ void TextEditor::paintEvent(QPaintEvent *event)
     /*!
      * cursorPosition 保持 -1：让 Qt 自己别画光标，由下面 drawCaret() 统一负责。
      *
-     * 为什么要自己画？因为"光标该不该显示"（闪烁相位）在 Qt 里是
-     * QWidgetTextControl 的私有状态，只由它自己的闪烁定时器维护。
-     * 本控件整个 paintEvent 都是自己写的（要画纸张、页边距），
-     * 走到 documentLayout()->draw() 的时候那个状态早就对不上了 ——
-     * 光标要么不画，要么画在另一套坐标里。
-     * 自己画只有一处坐标来源（documentToViewport()），不会再分叉。
+     * 为什么要自己画？“光标该不该显示”（闪烁相位）在 Qt 里是
+     * QWidgetTextControl 的私有状态，而本控件整个 paintEvent 都是自己写的，
+     * 走到 documentLayout()->draw() 的时候那个状态早就对不上了。
+     * 自己画只有一处坐标来源（render 层的行落点），不会再分叉。
      */
     context.cursorPosition = -1;
+    // 可见范围（文档坐标）：渲染层用它跳过看不见的段落
+    context.clip = docToView.inverted().mapRect(QRectF(event->rect()));
     /*!
      * 选区高亮也必须自己填。
      *
      * QTextEdit 平时是在 QWidgetTextControl::drawContents() 里把当前选区
      * 塞进 PaintContext::selections 再交给文档布局画的；
      * 本控件为了画纸张整个 paintEvent 都是自己写的，根本没走那条路，
-     * 于是 selections 一直是空的 —— 表现就是"能选中（键盘、鼠标都正常，
-     * 复制也正常）但屏幕上完全看不出选没选"。
-     *
-     * 颜色取调色板里的 Highlight / HighlightedText，也就是
-     * 构造函数里钉死的那套（深色主题下默认给的浅色前景落到白纸上等于隐形）。
+     * 于是 selections 一直是空的 —— 表现就是“能选中（键盘、鼠标都正常，
+     * 复制也正常）但屏幕上完全看不出选没选”。
      */
     {
         const QTextCursor sel = textCursor();
@@ -754,209 +1179,246 @@ void TextEditor::paintEvent(QPaintEvent *event)
     }
 
     /*!
-     * 会被"变形后的字形 / 手写笔迹"整格替换掉的位置：把原字**裁掉**。
+     * 会被“变形后的字形 / 手写笔迹”整格替换掉的位置：把原字**裁掉**。
      *
-     * 这是"变形后的文字有个白底、把选框挡住"的正解。之前是在效果层里往
-     * 纸面上刷一块底色去盖原字 —— 可效果层画在正文（含选区高亮）之上，
-     * 那块底色把选区也一起盖掉了，只在边上留 1 像素蓝边。
-     * 换成"正文这一格不画"之后，隐藏原字和显示选区互不干扰，
-     * 也彻底不需要任何底色；打印和导出（tripaRenderToDevice）用同一份计划，
-     * 屏幕上什么样纸上就什么样。
+     * 之前是在效果层里往纸面上刷一块底色去盖原字——可效果层画在正文
+     * （含选区高亮）之上，那块底色把选区也一起盖掉了，只在边上留 1 像素蓝边。
+     * 换成“正文这一格不画”之后，隐藏原字和显示选区互不干扰，
+     * 也彻底不需要任何底色；打印和导出（tripaRenderToDevice）用同一份计划。
      *
      * 为什么用裁剪路径而不是 QTextLayout::setFormats（给这一格设透明前景）：
      * setFormats 会 invalidate 布局 —— 而布局一旦失效，任何**之前**拿到的
-     * QTextLine / blockBoundingRect 都成了悬垂引用，别处再调 line.y() 就直接
-     * 段错误（实测就是这么崩的，崩在 QTextLine::y() 里）。
-     * 裁剪是纯绘制期的，不碰布局、不发信号、不进撤销栈，谁也影响不到。
+     * QTextLine / blockBoundingRect 都成了悬垂引用（实测会直接段错误）。
      */
-    QVector<QPair<int, int>> hiddenRanges;
-    QPainterPath hiddenHoles;   // 文档坐标：要被裁掉的那些格子
+    /*!
+     * 效果显示表：**只要看得见的那几段**（计算层的按需单位）。
+     *
+     * 以前这里是 `planEffects(document(), ...)` —— 每帧把全篇过一遍，
+     * 而且一次绘制要过**两遍**（这里挖洞一遍、画效果时又一遍）。
+     * 稿子越长每帧越慢，20000 字的时候光规划就 150ms。
+     *
+     * 现在：按段落缓存（effectplanner.h），几何在后台分片算，
+     * 这里只读结果 —— 视图一帧的代价只跟屏幕上有几段有关。
+     */
+    /*!
+     * 一帧的**分相耗时**（只在一帧很慢时才打日志，见函数末尾）。
+     *
+     * 排查"点一下加噪声卡好几秒"这类问题时，光知道"卡"没用：
+     * 可能是规划、可能是绘制、可能是几何。这里把每一相的毫秒量下来，
+     * 下次再卡就是日志里一行字的事。
+     */
+    QElapsedTimer phaseClock;
+    phaseClock.start();
+    qint64 planMs = 0;
+    qint64 textMs = 0;
+    qint64 effectMs = 0;
+    int itemCount = 0;
+
+    const QPair<int, int> visibleBlocks = m_layout->blockRangeOnPages(firstPage, lastPage);
+    const bool wantEffects = m_effectsVisible && m_options.anyLayer();
+    m_planner->beginFrame();
+    if (wantEffects)
+        m_planner->requestRange(visibleBlocks.first, visibleBlocks.second);
+    planMs = phaseClock.restart();
+
+    QRegion hiddenHoles; // 文档坐标：要被裁掉的那些格子
     QAbstractTextDocumentLayout::PaintContext selectionOnly;
     bool hasSelectionPass = false;
-    if (m_effectsVisible && m_options.anyLayer()) {
-        const QVector<EffectDrawItem> items = planEffects(document(), m_options, &hiddenRanges);
-        if (!hiddenRanges.isEmpty()) {
-            hiddenHoles.setFillRule(Qt::OddEvenFill);
-            /*!
-             * 只挖 item.hidden 的那些格子。
-             *
-             * 这里以前是"只要有一个字被替换，就把本轮**所有**效果字符的格子
-             * 全挖掉"——手写层开了替换、扭曲层还在叠加模式时，
-             * 扭曲那些字的原字也被顺手裁掉了，屏幕上看着就是"叠加上去的字
-             * 底下空空如也，没法对照"。该不该隐藏由 planEffects 一处说了算。
-             */
+    if (wantEffects) {
+        /*!
+         * 只挖 `item.hidden` 的那些格子 —— 而且只有**几何已经算好**的格子才是 hidden
+         * （见 prepareEffectItem）。几何还没算好的格子正文照原样画着，
+         * 不会出现"原字没了、新字还没来"的空窗。
+         */
+        for (int n = visibleBlocks.first; n <= visibleBlocks.second; ++n) {
+            const QVector<EffectDrawItem> &items = m_planner->items(n);
+            itemCount += items.size();
             for (const EffectDrawItem &item : items) {
                 if (item.hidden)
-                    hiddenHoles.addRect(item.charRect);
+                    hiddenHoles += item.charRect.toAlignedRect();
             }
         }
     }
 
     /*!
-     * 选区背景必须**单独画一遍、且不带上面那套裁剪**。
+     * 选区背景必须**单独画一遍、且不带“挖洞”裁剪**。
      *
-     * 裁剪是按"格子矩形"挖的，而选区高亮画的正是同一批格子 ——
-     * 一起交给 documentLayout()->draw() 的话，高亮会连同原字一起被挖掉：
-     * 选中变形后的文字时，变形层是深蓝墨、底下的高亮也没了，
-     * 看着就是"选区被盖住了"（实测选区色像素从 8400 掉到 1084）。
-     *
-     * 所以分两步走：
-     *   1. 不裁剪，先把选区背景铺满（前景设成透明，免得把正文字形也画一遍）；
-     *   2. 再带上"挖洞"裁剪，画正文 —— 此时原字被挖掉，铺好的高亮留在下面。
+     * 裁剪是按“格子矩形”挖的，而选区高亮画的正是同一批格子 ——
+     * 一起交给 draw() 的话，高亮会连同原字一起被挖掉，
+     * 看着就是“选区被盖住了”。所以分两步走：
+     *   1. 先把选区背景铺满（前景设成透明，免得把正文字形也画一遍）；
+     *   2. 再带上“挖洞”裁剪，画正文 —— 此时原字被挖掉，铺好的高亮留在下面。
      */
     if (!hiddenHoles.isEmpty()) {
         QAbstractTextDocumentLayout::PaintContext selOnly = context;
-        for (QAbstractTextDocumentLayout::Selection &s : selOnly.selections) {
-            // 前景透明：这一遍只要背景色，正文字形由下一遍（带裁剪）负责
+        for (QAbstractTextDocumentLayout::Selection &s : selOnly.selections)
             s.format.setForeground(QColor(0, 0, 0, 0));
-        }
         selectionOnly = selOnly;
         hasSelectionPass = !selectionOnly.selections.isEmpty();
     }
 
-    for (int page = firstPage; page <= lastPage; ++page) {
-        // 这一页的纸面（viewport 坐标）
-        const QRectF pageRect(paperOrigin + QPointF(0.0, page * paperH),
-                              QSizeF(paperW, paperH));
+    /*!
+     * 3. 正文窗口的裁剪 + 挖洞（**用 QRegion，不用 QPainterPath**）。
+     *
+     * “可见页的正文窗口”是这一页允许出现文字的唯一区域：
+     * 页边距、纸缝（页与页之间那道空白）都在窗口外面。
+     * 就算排版算错了，屏幕上也不可能看到字压住下边界 ——
+     * 这一层裁剪是“不越界”的最后一道保险。
+     *
+     * 挖洞不用 QPainterPath 不是口味问题，是实测出来的性能悬崖：
+     * 每页几百个格子当洞加进一个奇偶规则的 QPainterPath 里，
+     * 光是把它变成裁剪区就要好几秒，而且格子越多越慢
+     * （实测一帧 469ms -> 3261ms -> 8176ms）。
+     * QRegion 是**按行合并**的：一整行里相邻的格子会并成一个矩形，
+     * 几百个洞最后只剩下几十个矩形，裁剪代价回到正常量级。
+     */
+    QRegion bodyRegion;
+    for (int page = firstPage; page <= lastPage; ++page)
+        bodyRegion += metrics.bodyRect(page).toAlignedRect();
 
-        // 阴影：只在最外侧留一圈，多页之间不重复描边
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(QColor(0, 0, 0, 70));
-        painter.drawRect(pageRect.translated(2.0, 3.0));
+    painter.save();
+    painter.setClipRegion(bodyRegion);
 
-        painter.setBrush(Qt::white);
-        painter.setPen(QPen(QColor(0x8a, 0x8d, 0x92), 1));
-        painter.drawRect(pageRect);
+    if (hasSelectionPass)
+        m_layout->draw(&painter, selectionOnly);
 
-        painter.save();
-        painter.setClipRect(pageRect);
+    if (!hiddenHoles.isEmpty())
+        painter.setClipRegion(bodyRegion.subtracted(hiddenHoles));
 
+    m_layout->draw(&painter, context);
+    textMs = phaseClock.restart();
+
+    /*!
+     * 手写 / 扭曲层：**和正文画在同一次绘制里**，就在正文之后、光标之前。
+     *
+     * 它以前是画在一个盖在 viewport 上的透明子控件（EffectsOverlay）里的。
+     * 那样有两个代价，第二个是致命的：
+     *   1. 两套重绘时机（滚动、改选项都要手动通知）容易不同步；
+     *   2. “透明子控件”在 QWidget 里的合成语义很脆 ——
+     *      WA_TranslucentBackground 会让 Qt 把子控件的区域从父控件的
+     *      不透明区域里挖掉，于是 QWidget::grab() / 打印 / 导出
+     *      全都只剩一个洞（实测：单独抓图有 2834 个像素，合成抓图里
+     *      一个新墨点都没有）。
+     * 画在一起就没这回事：就是一次普通绘制，屏幕、抓图、PDF、打印机
+     * 走的是同一段代码、同一份坐标。
+     */
+    if (wantEffects) {
         /*!
-         * 第 2 页起在纸的**下边距**里写一行小字页码
-         * （"第 2 页 / 共 5 页"），正文区里什么都不画。
+         * 关键：**先把“挖洞”的裁剪去掉**再画效果层。
          *
-         * 这里以前画的是正文区的**蓝色虚线框** —— 那是个很坏的设计：
-         * 虚线框和正文区一样大，看着就像"凭空多出来一页"，
-         * 而且当时正文的位置又确实不对（见 applyLayoutMetrics 里那段），
-         * 于是"后几页内容一模一样"成了用户看到的样子。
-         * 页码写在页边距里，既说明了这是第几页，又不会和正文混淆。
+         * 洞的位置正是要被变形字形替换掉的那些格子，也就是效果层要画的
+         * 地方 —— 带着裁剪画效果层，等于把新字形也一起裁掉了：
+         * 原字确实没了，新字也没了，屏幕上就只剩一片空白。
+         * 换成普通的“正文窗口”裁剪：效果层不该画到页边距外面去。
          */
-        if (page > 0) {
-            painter.setPen(QColor(0x9a, 0x9d, 0xa2));
-            QFont pageFont = font();
-            pageFont.setPointSizeF(qMax(6.0, pageFont.pointSizeF() * 0.8));
-            painter.setFont(pageFont);
-            const QRectF footer(pageRect.left(), pageRect.bottom() - bodyOriginPx().y() * 0.6,
-                                pageRect.width(), bodyOriginPx().y() * 0.6);
-            painter.drawText(footer, Qt::AlignHCenter | Qt::AlignVCenter,
-                             tr("第 %1 页").arg(page + 1));
-        }
-
+        painter.setClipping(false);
+        painter.setClipRegion(bodyRegion);
+        EffectRenderOptions local = m_options;
+        local.missing.clear();
         /*!
-         * 正文：原点 = documentOriginInViewport()，再挪到第 page 页的正文区，
-         * 最后乘上缩放 —— **正文、效果层、光标三者必须共用这一个变换**
-         * （documentToViewport 里就是它），否则第 2 页起的光标会一行行错开，
-         * 放大之后字和光标也会各走各的。
-         *
-         * 缩放之后坐标系就回到**文档坐标**了，所以下面所有矩形
-         * （裁剪、挖洞、页范围的奇偶路径）一律用 bodyDocSize，不是屏幕尺寸。
+         * **只落笔，不算几何**：每一项的折线 / 填充路径都是计算层
+         * （EffectPlanner 的后台任务）事先算好的，这里只是查表 + 画。
+         * 还没算好的项 `art.ready` 是假，`drawEffectItem` 直接跳过 ——
+         * 那一格的正文没被挖掉，所以屏幕上看到的是原字，不是空白。
          */
-        painter.translate(docOrigin + QPointF(0.0, page * paperH));
-        painter.scale(m_zoom, m_zoom);
-        painter.setClipRect(QRectF(QPointF(0.0, 0.0), bodyDocSize));
-
-        // 第一遍：选区背景（不带"挖洞"裁剪，否则高亮会被一起挖掉）
-        if (hasSelectionPass)
-            document()->documentLayout()->draw(&painter, selectionOnly);
-
-        if (!hiddenHoles.isEmpty()) {
-            /*!
-             * 第二遍：裁掉"会被变形字形替换掉的格子"。
-             *
-             * 这是个"矩形 + 一堆洞"的奇偶路径：偶数次穿越为实、奇数次为空，
-             * 所以正文矩形和洞之间那块就被挖掉了。
-             * 注意每页都要用**这一页的正文矩形**重算：文档坐标是全局的、
-             * 跨页累加的，只按第一页的正文矩形挖的话，第 2 页起会被整页裁掉。
-             */
-            QPainterPath pageClip;
-            pageClip.setFillRule(Qt::OddEvenFill);
-            pageClip.addRect(QRectF(QPointF(0.0, 0.0), bodyDocSize));
-            pageClip.addPath(hiddenHoles);
-            painter.setClipPath(pageClip, Qt::IntersectClip);
-        }
-        document()->documentLayout()->draw(&painter, context);
-
-        /*!
-         * 手写 / 扭曲层：**和正文画在同一次绘制里**，就在正文之后、光标之前。
-         *
-         * 它以前是画在一个盖在 viewport 上的透明子控件（EffectsOverlay）里的。
-         * 那样有两个代价，第二个是致命的：
-         *   1. 两套重绘时机（滚动、改选项都要手动通知）容易不同步；
-         *   2. "透明子控件"在 QWidget 里的合成语义很脆 ——
-         *      WA_TranslucentBackground 会让 Qt 把子控件的区域从父控件的
-         *      不透明区域里挖掉，于是父控件那块干脆不画，子控件的内容又没真正
-         *      合成上去。屏幕上看是好的，可 QWidget::grab() / 打印 / 导出
-         *      全都只剩一个洞（实测：覆盖层单独抓图有 2834 个像素，
-         *      合成抓图里一个新墨点都没有）。
-         * 画在一起就没这回事：就是一次普通绘制，屏幕、抓图、PDF、打印机
-         * 走的是同一段代码、同一份坐标。
-         */
-        if (m_effectsVisible && m_options.anyLayer()) {
-            /*!
-             * 关键：**先把上面那套"挖洞"的裁剪去掉**再画效果层。
-             *
-             * 洞的位置正是要被变形字形替换掉的那些格子，也就是效果层要画的
-             * 地方 —— 带着裁剪画效果层，等于把新字形也一起裁掉了：
-             * 原字确实没了，新字也没了，屏幕上就只剩一片空白
-             * （实测"消失的像素 1154 个、新墨 0 个"就是这个）。
-             */
-            painter.setClipping(false);
-            painter.setClipRect(QRectF(QPointF(0.0, 0.0), bodyDocSize));
-            EffectRenderOptions local = m_options;
-            local.missing.clear();
-            renderEffects(&painter, document(), local);
-        }
-        painter.restore();
+        for (int n = visibleBlocks.first; n <= visibleBlocks.second; ++n)
+            renderPreparedEffects(&painter, m_planner->items(n), local);
+        effectMs = phaseClock.restart();
     }
 
-    // 3. 光标：自己画，坐标只认 documentToViewport()
-    drawCaret(&painter, docOrigin);
+    painter.restore(); // 正文窗口的裁剪
+
+    // 4. 光标：自己画，坐标和正文完全同一套
+    drawCaret(&painter);
+
+    /*!
+     * 一帧超过 100ms 就要说清楚"时间花在哪一相"。
+     *
+     * 阈值 100ms 是有意义的：60fps 的一帧是 16ms，100ms 已经能看出顿挫；
+     * 而正常一帧（含效果层）也就几十毫秒，所以这里不会被日常绘制刷屏。
+     */
+    if (const qint64 total = phaseClock.elapsed() + planMs + textMs + effectMs; total > 100) {
+        TRIPA_WARN("paint",
+                   QStringLiteral("慢帧 %1ms：规划 %2ms / 正文 %3ms / 效果 %4ms（%5 页，%6 段，%7 个效果格子）")
+                       .arg(total)
+                       .arg(planMs)
+                       .arg(textMs)
+                       .arg(effectMs)
+                       .arg(lastPage - firstPage + 1)
+                       .arg(visibleBlocks.second - visibleBlocks.first + 1)
+                       .arg(itemCount));
+    }
 }
 
 /*!
  * 画光标竖条。
  *
- * 位置一律走 `caretRectInDocument()`（**文档坐标**，滚动量已经加回来了），
- * 再加一次 `documentOriginInViewport()` —— 和正文、效果层完全同一个原点；
- * 缩放也走同一个倍数（光标跟着字一起变大，不然放大之后光标细得看不见）。
+ * 位置一律走 `caretRectInDocument()`（**文档坐标**，几何来自渲染层的行落点），
+ * 和正文、效果层完全同一套坐标 —— 分页之后光标不可能跑到纸外面。
  *
- * 闪烁：用 `QApplication::cursorFlashTime()` 驱动 QTextEdit 自带的 blink 定时器，
- * 相位由 `cursorRect()` 是否为空来判断（Qt 在"不该显示"时返回空矩形）。
- * 这样跟系统的闪烁设置保持一致，不用自己维护相位。
+ * 闪烁看 `m_caretVisible`（自己的 QTimer 维护相位，见 restartCaretBlink），
+ * 但**系统关了闪烁（cursorFlashTime() == 0）就一直亮着**：
+ * 可见性最终由系统的闪烁设置说了算，自己维护相位时很容易把
+ * “相位”和“设置”搞成两回事（设置改了相位不知道）。所以每次都现问一次。
+ *
+ * 线宽用“设备像素 ÷ 缩放”换算，所以放大之后光标不会变成一根粗棒。
  */
-void TextEditor::drawCaret(QPainter *painter, const QPointF &docOrigin)
+void TextEditor::drawCaret(QPainter *painter)
 {
     if (!hasFocus() && !viewport()->hasFocus())
-        return;                       // 没焦点不画光标，跟系统惯例一致
+        return; // 没焦点不画光标，跟系统惯例一致
+    // 闪烁的暗相位（系统把闪烁关了就一直亮着）
+    if (QApplication::cursorFlashTime() > 0 && !m_caretVisible)
+        return;
 
-    const QRect caret = caretRectInDocument();   // 文档坐标
+    const QRectF caret = caretRectInDocument(); // 文档坐标
     if (caret.isEmpty())
-        return;                         // 闪烁的暗相位
+        return;
 
     painter->save();
     painter->setPen(Qt::NoPen);
     painter->setBrush(palette().color(QPalette::Text));
-    const QRectF r(QPointF(docOrigin.x() + caret.x() * m_zoom,
-                           docOrigin.y() + caret.y() * m_zoom),
-                   QSizeF(qMax(1.0, caret.width() * m_zoom), caret.height() * m_zoom));
-    painter->drawRect(r);
+    const double width = qMax(1.0, double(cursorWidth())) / qMax(0.01, m_zoom);
+    painter->drawRect(QRectF(caret.x(), caret.y(), width, caret.height()));
     painter->restore();
 }
 
 void TextEditor::resizeEvent(QResizeEvent *event)
 {
+    /*!
+     * 记录每一次尺寸变化（含旧尺寸）：排查"一秒几百次 resize"这类活锁时，
+     * 必须知道**尺寸在两个值之间来回跳**还是"尺寸没变却一直发事件"。
+     */
+    static int resizeCount = 0;
+    static qint64 lastResizeMs = -1;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (lastResizeMs < 0 || nowMs - lastResizeMs > 1000) {
+        /*! 阈值 150：正常拉窗口一秒也就几十次（见下面 updateScrollRange 里的说明） */
+        if (resizeCount > 150)
+            TRIPA_WARN("layout",
+                       QStringLiteral("TextEditor 一秒里 resize 了 %1 次（现在 %2x%3）—— "
+                                      "尺寸在两个值之间来回跳，或者尺寸没变却一直发事件")
+                           .arg(resizeCount)
+                           .arg(width())
+                           .arg(height()));
+        resizeCount = 0;
+        lastResizeMs = nowMs;
+    }
+    ++resizeCount;
+    TRIPA_DEBUG("layout",
+                QStringLiteral("resize：%1x%2 -> %3x%4（viewport %5x%6 边距=%7 滚动=%8..%9）")
+                    .arg(event->oldSize().width())
+                    .arg(event->oldSize().height())
+                    .arg(event->size().width())
+                    .arg(event->size().height())
+                    .arg(viewport()->width())
+                    .arg(viewport()->height())
+                    .arg(viewportMargins().left())
+                    .arg(verticalScrollBar()->minimum())
+                    .arg(verticalScrollBar()->maximum()));
+
     QTextEdit::resizeEvent(event);
-    updateScrollRange();
+    updateScrollRange(QStringLiteral("resizeEvent"));
 }
 
 void TextEditor::scrollContentsBy(int dx, int dy)

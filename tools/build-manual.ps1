@@ -43,7 +43,11 @@ $qtlibs = @(
 
 $mocHeaders = @(
     'baselineadjust.h', 'fontspool.h', 'mainwindow.h', 'pagesetup.h',
-    'paragraph.h', 'proofsheet.h', 'texteditor.h'
+    'paragraph.h', 'proofsheet.h', 'texteditor.h',
+    # 新加的两层（都有 Q_OBJECT，必须 moc）
+    'paginatinglayout.h', 'richdocument.h',
+    # 效果层的计算层（EffectPlanner 有信号）+ 任务调度器
+    'effectplanner.h', 'jobrunner.h'
 )
 
 function Invoke-Step([string]$what, [scriptblock]$body) {
@@ -78,6 +82,24 @@ foreach ($h in $mocHeaders) {
             '-o' $out "$Root/$h"
     }
 }
+
+<#
+    AutoMoc 生成的 mocs_compilation.cpp 是按 **CMake 配置时**的源文件列表写的。
+    手工这条路不重跑 CMake，所以新加的头文件（有 Q_OBJECT）要在这里补一行
+    #include，否则链接期报 “undefined reference to vtable”。
+    幂等：已经在了就不重复加（CMake 重新生成过这个文件时也不会写重）。
+#>
+$mocCompilation = "$Build/tripa_autogen/mocs_compilation.cpp"
+if (Test-Path $mocCompilation) {
+    $text = Get-Content $mocCompilation -Raw
+    foreach ($h in $mocHeaders) {
+        $include = '#include "EWIEGA46WW/moc_' + ($h -replace '\.h$', '.cpp') + '"'
+        if ($text -notmatch [regex]::Escape($include)) {
+            Add-Content -Path $mocCompilation -Value $include
+            Write-Host "  mocs_compilation.cpp += $include"
+        }
+    }
+}
 Pop-Location
 
 # ------------------------------------------------------------------ tripa
@@ -88,7 +110,9 @@ if ($Targets -contains 'tripa') {
     $sources = @(
         'main.cpp', 'mainwindow.cpp', 'texteditor.cpp', 'effectsrenderer.cpp',
         'handwriting.cpp', 'noise.cpp', 'effect.cpp', 'pagesetup.cpp', 'paragraph.cpp',
-        'fontspool.cpp', 'proofsheet.cpp', 'baselineadjust.cpp', 'tripadocument.cpp'
+        'fontspool.cpp', 'proofsheet.cpp', 'baselineadjust.cpp', 'tripadocument.cpp',
+        'tripalog.cpp', 'paginatinglayout.cpp', 'richdocument.cpp',
+        'jobrunner.cpp', 'effectplanner.cpp'
     )
     foreach ($s in $sources) {
         $obj = "CMakeFiles/tripa.dir/$s.obj"
@@ -132,13 +156,25 @@ if ($Targets -contains 'tripa') {
 }
 
 # ------------------------------------------------------------------ 测试程序
-function BuildTest([string]$name, [string[]]$sources) {
+<#
+    测试程序。
+    \a mocFor：这些头文件里有 Q_OBJECT，但对应的 moc_*.cpp 默认只编进了 tripa 那个
+    目标（mocs_compilation.cpp），测试程序里要用就得自己再编一份 ——
+    否则链接期报 “undefined reference to vtable / staticMetaObject”。
+#>
+function BuildTest([string]$name, [string[]]$sources, [string[]]$mocFor = @()) {
     Write-Host "== $name"
     $objs = @()
     Push-Location $Build
     foreach ($s in $sources) {
         $obj = "CMakeFiles/$name.dir/$s.obj"
         Compile "$Root/$s" "$Build/$obj" @()
+        $objs += $obj
+    }
+    foreach ($h in $mocFor) {
+        $stub = $h -replace '\.h$', '.cpp'
+        $obj = "CMakeFiles/$name.dir/moc_$stub.obj"
+        Compile "$Build/tripa_autogen/EWIEGA46WW/moc_$stub" "$Build/$obj" @()
         $objs += $obj
     }
     Invoke-Step "链接 $name.exe" {
@@ -153,6 +189,26 @@ if ($Targets -contains 'test_document') {
 }
 if ($Targets -contains 'test_core') {
     BuildTest 'test_core' @('tests/test_core.cpp', 'handwriting.cpp', 'noise.cpp', 'effect.cpp')
+}
+if ($Targets -contains 'test_layout') {
+    BuildTest 'test_layout' @('tests/test_layout.cpp', 'paginatinglayout.cpp', 'richdocument.cpp',
+                             'pagesetup.cpp', 'paragraph.cpp', 'tripadocument.cpp',
+                             'handwriting.cpp', 'noise.cpp', 'effect.cpp', 'tripalog.cpp') `
+              @('paginatinglayout.h', 'richdocument.h', 'pagesetup.h', 'paragraph.h')
+}
+if ($Targets -contains 'bench_effects') {
+    BuildTest 'bench_effects' @('tests/bench_effects.cpp', 'paginatinglayout.cpp', 'richdocument.cpp',
+                              'pagesetup.cpp', 'paragraph.cpp', 'effectsrenderer.cpp',
+                              'handwriting.cpp', 'noise.cpp', 'effect.cpp', 'tripalog.cpp') `
+              @('paginatinglayout.h', 'richdocument.h', 'pagesetup.h', 'paragraph.h')
+}
+if ($Targets -contains 'test_jobs') {
+    BuildTest 'test_jobs' @('tests/test_jobs.cpp', 'jobrunner.cpp', 'effectplanner.cpp',
+                            'effectsrenderer.cpp', 'paginatinglayout.cpp', 'richdocument.cpp',
+                            'pagesetup.cpp', 'paragraph.cpp', 'handwriting.cpp', 'noise.cpp',
+                            'effect.cpp', 'tripalog.cpp') `
+              @('paginatinglayout.h', 'richdocument.h', 'effectplanner.h', 'jobrunner.h',
+                'pagesetup.h', 'paragraph.h')
 }
 
 Write-Host '构建完成'

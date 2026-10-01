@@ -1,5 +1,6 @@
 #include "pagesetup.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -7,9 +8,10 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPainter>
 #include <QPixmap>
-#include <QPrinter>
+#include <QtPrintSupport/qprinter.h>
 #include <QRadioButton>
 #include <QStackedWidget>
 #include <QVBoxLayout>
@@ -214,6 +216,43 @@ QWidget *PageSetupDialog::buildFormPanel()
     marginForm->addRow(tr("装订线:"), m_gutterSpin);
 
     layout->addWidget(marginGroup);
+
+    /*!
+     * 页眉页脚：**默认两个都不勾**。
+     *
+     * 它们不属于排版（画在纸的上下边距里，占不到正文窗口），
+     * 所以打开它们不会让一个字挪位置 —— 这一条在 test_layout 里钉着。
+     * 文字里可以用 {page}（当前页）/ {pages}（总页数）/ {title}（文档标题）。
+     */
+    auto *chromeGroup = new QGroupBox(tr("页眉页脚"), box);
+    auto *chromeForm = new QFormLayout(chromeGroup);
+    chromeForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    m_headerCheck = new QCheckBox(tr("显示页眉"), chromeGroup);
+    m_headerCheck->setToolTip(tr("页眉画在上边距里，不影响正文排版"));
+    m_headerEdit = new QLineEdit(m_setup.headerText, chromeGroup);
+    m_headerEdit->setPlaceholderText(tr("例如：{title}"));
+    m_headerEdit->setEnabled(m_setup.headerEnabled);
+    m_headerCheck->setChecked(m_setup.headerEnabled);
+    chromeForm->addRow(m_headerCheck, m_headerEdit);
+
+    m_footerCheck = new QCheckBox(tr("显示页脚"), chromeGroup);
+    m_footerCheck->setToolTip(tr("页脚画在下边距里，不影响正文排版"));
+    m_footerEdit = new QLineEdit(m_setup.footerText, chromeGroup);
+    m_footerEdit->setPlaceholderText(tr("例如：第 {page} 页 / 共 {pages} 页"));
+    m_footerEdit->setEnabled(m_setup.footerEnabled);
+    m_footerCheck->setChecked(m_setup.footerEnabled);
+    chromeForm->addRow(m_footerCheck, m_footerEdit);
+
+    m_chromeFontSpin = new QDoubleSpinBox(chromeGroup);
+    m_chromeFontSpin->setRange(5.0, 24.0);
+    m_chromeFontSpin->setSingleStep(0.5);
+    m_chromeFontSpin->setDecimals(1);
+    m_chromeFontSpin->setSuffix(tr(" 磅"));
+    m_chromeFontSpin->setValue(m_setup.chromeFontSizePt);
+    chromeForm->addRow(tr("字号:"), m_chromeFontSpin);
+
+    layout->addWidget(chromeGroup);
     layout->addStretch(1);
 
     // --- 信号 ---
@@ -222,9 +261,20 @@ QWidget *PageSetupDialog::buildFormPanel()
     connect(m_marginPresetCombo, &QComboBox::currentIndexChanged,
             this, &PageSetupDialog::onMarginPresetChanged);
     for (QDoubleSpinBox *spin : {m_widthSpin, m_heightSpin, m_leftSpin, m_topSpin,
-                                 m_rightSpin, m_bottomSpin, m_gutterSpin}) {
+                                 m_rightSpin, m_bottomSpin, m_gutterSpin,
+                                 m_chromeFontSpin}) {
         connect(spin, &QDoubleSpinBox::valueChanged, this, &PageSetupDialog::refreshPreview);
     }
+    // 页眉页脚：勾了才让改文字；任何改动都要刷新预览
+    const auto chromeToggled = [this] {
+        m_headerEdit->setEnabled(m_headerCheck->isChecked());
+        m_footerEdit->setEnabled(m_footerCheck->isChecked());
+        refreshPreview();
+    };
+    connect(m_headerCheck, &QCheckBox::toggled, this, chromeToggled);
+    connect(m_footerCheck, &QCheckBox::toggled, this, chromeToggled);
+    connect(m_headerEdit, &QLineEdit::textChanged, this, &PageSetupDialog::refreshPreview);
+    connect(m_footerEdit, &QLineEdit::textChanged, this, &PageSetupDialog::refreshPreview);
     connect(m_widthSpin, &QDoubleSpinBox::valueChanged, this, [this] {
         if (m_updating)
             return;
@@ -307,6 +357,11 @@ void PageSetupDialog::collect()
     m_setup.marginRightMm = m_rightSpin->value();
     m_setup.marginBottomMm = m_bottomSpin->value();
     m_setup.gutterMm = m_gutterSpin->value();
+    m_setup.headerEnabled = m_headerCheck->isChecked();
+    m_setup.headerText = m_headerEdit->text();
+    m_setup.footerEnabled = m_footerCheck->isChecked();
+    m_setup.footerText = m_footerEdit->text();
+    m_setup.chromeFontSizePt = m_chromeFontSpin->value();
 }
 
 void PageSetupDialog::refreshPreview()
@@ -374,6 +429,38 @@ void PageSetupDialog::refreshPreview()
             p.setBrush(QColor(230, 160, 60, 70));
             p.setPen(QPen(QColor(200, 130, 30), 1, Qt::DotLine));
             p.drawRect(gutter);
+        }
+
+        /*!
+         * 页眉页脚：勾了就在预览里画出来（画在上/下边距里）。
+         * 分页排版真正画它们的是 `PaginatingLayout::drawChrome()`，
+         * 这里只是让“勾上之后纸长什么样”一眼可见。
+         */
+        if (m_setup.headerEnabled || m_setup.footerEnabled) {
+            QFont chromeFont = p.font();
+            chromeFont.setPointSizeF(qMax(4.0, m_setup.chromeFontSizePt * scale * 0.9));
+            p.setFont(chromeFont);
+            p.setPen(QColor(90, 90, 90));
+            const auto shown = [this](const QString &raw) {
+                QString s = raw;
+                s.replace(QStringLiteral("{page}"), QStringLiteral("1"));
+                s.replace(QStringLiteral("{pages}"), QStringLiteral("1"));
+                s.replace(QStringLiteral("{title}"), m_setup.presetName);
+                return s;
+            };
+            if (m_setup.headerEnabled) {
+                const QRectF head(pageRect.left() + m.left() * scale, pageRect.top(),
+                                  pageRect.width() - (m.left() + m.right()) * scale,
+                                  m.top() * scale);
+                p.drawText(head, Qt::AlignHCenter | Qt::AlignVCenter, shown(m_setup.headerText));
+            }
+            if (m_setup.footerEnabled) {
+                const QRectF foot(pageRect.left() + m.left() * scale,
+                                  pageRect.bottom() - m.bottom() * scale,
+                                  pageRect.width() - (m.left() + m.right()) * scale,
+                                  m.bottom() * scale);
+                p.drawText(foot, Qt::AlignHCenter | Qt::AlignVCenter, shown(m_setup.footerText));
+            }
         }
     }
     m_preview->setPixmap(pix);

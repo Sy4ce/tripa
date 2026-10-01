@@ -2,10 +2,14 @@
 
 #include "baselineadjust.h"
 #include "effectsrenderer.h"
+#include "effectplanner.h"
 #include "handwriting.h"
+#include "jobrunner.h"
 #include "pagesetup.h"
+#include "paginatinglayout.h"
 #include "proofsheet.h"
 #include "texteditor.h"
+#include "tripalog.h"
 
 #include <QAbstractTextDocumentLayout>
 #include <QApplication>
@@ -17,20 +21,27 @@
 #include <QIcon>
 #include <QImage>
 #include <QLabel>
+#include <QKeyEvent>
 #include <QLocale>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPageLayout>
+#include <QPagedPaintDevice>
 #include <QPainterPath>
 #include <QPdfWriter>
 #include <QPixmap>
+#include <QProcess>
+#include <QProgressBar>
 #include <QPushButton>
+#include <QScreen>
 #include <QScrollBar>
 #include <QSet>
 #include <QSlider>
 #include <QStringList>
 #include <QStyle>
+#include <QSysInfo>
 #include <QTableWidget>
+#include <QToolButton>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTextBlock>
@@ -45,6 +56,13 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cerrno>
+#include <cstdint>
+
+#if defined(Q_OS_WIN)
+#  include <windows.h> // 崩溃自检要 RaiseException（见 runCrashChild）
+#  include <process.h> // _spawnl：拉子进程，且不依赖命名管道（见 runCrashDumpProbe）
+#endif
 
 /*!
  * 把每一页渲染到 \a device：正文、手写、扭曲一起出，做到所见即所得。
@@ -60,111 +78,156 @@ void tripaRenderToDevice(QTextDocument *document,
                          QPainter *painter)
 {
     const QSizeF paperMm = setup.paperSizeMm();
-    const QMarginsF marginsPx = setup.bodyMarginsPx();
-    const QSizeF cardPx = setup.bodySizePx();
 
-    document->setDocumentMargin(0);
     /*!
-     * 分页高度 = **正文区高度**（不是纸高），因为这一路的排版原点和屏幕那条路
-     * 不一样：屏幕上每张纸的正文区是隔一个**纸高**放的，而这里是把
-     * "第 n 页的正文区"直接摞起来（见下面 `-page * cardPx.height()`）。
-     * 两套排法各自自洽就行 —— 但对齐的**结果**必须一样：每页一份内容、
-     * 四边页边距都留白。
+     * 打印 / 导出走的就是**编辑时那一套分页** —— 同一个 PaginatingLayout，
+     * 只把版面几何换成打印机 / PDF 的纸张。
+     *
+     * 这是“所见即所得”唯一可信的做法：屏幕上在哪儿断行、第几页放什么，
+     * 纸上就是同一份答案 —— 两边都是这一个渲染层算出来的。
+     * 以前这条路自己又写了一遍“正文区摞起来”的排法，还顺手把
+     * `document()->setPageSize()` 改成了正文区尺寸：两套排法各排各的，
+     * 迟早对不上（“屏幕上和导出不一样”就是这么来的）。
      */
-    document->setPageSize(cardPx);
+    PaginatingLayout *layout = installPaginatingLayout(document);
+    const RenderMetrics savedMetrics = layout->metrics();
+    const PageChrome savedChrome = layout->chrome();
+
+    const RenderMetrics metrics = RenderMetrics::fromPageSetup(setup);
+    layout->setMetrics(metrics);
+    layout->setChrome(PageChrome::fromPageSetup(setup));
 
     // 设备像素 / 96dpi 像素（96dpi 下 1mm = 25.4 px）
     const double zoom = (double(device->width()) / paperMm.width()) * 25.4 / PageSetup::kDpi;
-    const double pageHeightPx = paperMm.height() * PageSetup::kDpi / 25.4;
-    const int pages = qMax(1, int(std::ceil(document->size().height() / cardPx.height())));
+    const int pages = layout->pageCount();
 
     /*!
-     * 会被效果"整格替换掉"的字符：正文这一格必须**不画**。
+     * 会被效果“整格替换掉”的字符：正文这一格必须**不画**。
      *
      * 以前是让效果层往上刷一块纸色去盖原字，那块底色在屏幕上还会盖掉
-     * 选区高亮（用户看到的就是"变形后的字有个白底挡住选框"）。
-     * 现在改成绘制期把这一格裁掉，屏幕和纸面走同一份计划，谁也不欠谁一块底色。
-     *
-     * 用裁剪路径而不是给这一格设透明前景：设格式会 invalidate 布局，
-     * 让别处已经拿到的 QTextLine 变成悬垂引用（实测会直接段错误）。
-     * 裁剪是纯绘制期的，不碰布局。
-     *
-     * 该挖哪些格子一律看 EffectDrawItem::hidden —— 手写层和扭曲层一个口径。
-     * （这里以前只处理扭曲，于是"手写遮住正文"在屏幕上是遮住的、
-     *   导出 PDF 时原字又冒出来了，所见非所得。）
+     * 选区高亮。现在改成绘制期把这一格裁掉（奇偶路径控洞），
+     * 屏幕和纸面走同一份计划，谁也不欠谁一块底色。
      */
-    const QVector<EffectDrawItem> items = planEffects(document, options);
+    /*!
+     * 效果层交给**计算层**（effectplanner.h）：它按段落算显示表、把几何算好，
+     * 这里只读结果。
+     *
+     * 以前这里是 `planEffects(document, options)` 一次算全篇 + 每页再
+     * `renderEffects()` 一次（后者内部又 `planEffects` 一遍）——
+     * 十页的稿子等于把全篇规划十一遍，而且几何是在**逐页绘制时才现算**的。
+     * 现在按页准备（`requestRange` + `work()` 到底），既快又与屏幕同一份口径。
+     */
+    EffectPlanner planner(document, layout);
+    planner.setOptions(options);
 
     /*!
-     * 正文窗口（文档坐标下的第一页正文区）减去那些洞。
-     *
-     * 奇偶填充：窗口是实、洞是空 —— **两层**，别把"减完洞的窗口"
-     * 再当成一个 rect 加回去（那样窗口和洞会互相抵消，整页都画不出来）。
-     * 洞必须挑**落在窗口里**的那些：别的页的洞在原坐标里和窗口不相交，
-     * 直接加进奇偶路径会变成一块"实心岛"，平白多给出一片可绘制区域。
+     * 翻页：PDF / 打印机必须显式 `newPage()`，否则 N 页全画在第一页上
+     * （后几页用 `translate(-page*纸高)` 挪到了纸外面，看着就像“只导出第一页”）。
+     * 图像设备（QImage）没有页的概念，整篇按一张图画，超出部分自然被裁掉。
      */
-    QPainterPath windowPath;
-    {
-        const QRectF window(QPointF(0.0, 0.0), cardPx);
-        windowPath.setFillRule(Qt::OddEvenFill);
-        windowPath.addRect(window);
-        for (const EffectDrawItem &item : items) {
-            if (item.hidden && item.charRect.intersects(window))
-                windowPath.addRect(item.charRect);
-        }
-    }
+    QPagedPaintDevice *paged = dynamic_cast<QPagedPaintDevice *>(device);
 
     painter->save();
     painter->setRenderHint(QPainter::Antialiasing, true);
     painter->setRenderHint(QPainter::TextAntialiasing, true);
 
     for (int page = 0; page < pages; ++page) {
+        if (page > 0 && paged)
+            paged->newPage();
+
         painter->save();
-        // 把这一页的纸面左上角放到设备原点，再缩放到纸张尺寸
-        painter->translate(0.0, -double(page) * pageHeightPx);
+        // 文档坐标 -> 设备像素：先缩放，再把这一页的纸面左上角放到设备原点
         painter->scale(zoom, zoom);
-        // 正文画在页边距里面
-        painter->translate(marginsPx.left(), marginsPx.top());
+        painter->translate(0.0, -double(page) * metrics.paperHeightPx);
+
+        /*!
+         * 这一页要画的段落：显示表 + **几何**都先就位（打印 / 导出是模态操作，
+         * 这里同步算完；交互式绘制才需要分片，见 EffectWorkJob）。
+         *
+         * 按页准备而不是"一次算全篇"：一是显示表缓存有上限（见
+         * EffectPlanner 里的 kMaxCachedBlocks），二是长稿子一次全算会白占内存。
+         */
+        planner.beginFrame();
+        const QPair<int, int> pageBlocks = layout->blockRangeOnPages(page, page);
+        planner.requestRange(pageBlocks.first, pageBlocks.second);
+        /*!
+         * `requestRange` 只登记"这一段要算"，真正排队是 `requestGeometry()`
+         * （界面上它等 150ms 的"安静"，免得打字时白烧 CPU）。
+         * 打印 / 导出是模态操作，不需要等 —— 而是现在就算完。
+         */
+        planner.requestGeometry();
+        while (planner.work(256)) {
+            // 一直算到这一页的几何都好了
+        }
+
+        /*!
+         * 本页的“正文窗口 + 挖洞”裁剪路径（**页内坐标**：纸面左上角已平移到原点）。
+         *
+         * 洞必须挑**落在本页**的那些：别的页的洞平移过来会变成一块
+         * “实心岛”，平白多给出一片可绘制区域。
+         */
+        const QRectF bodyLocal(metrics.marginLeftPx, metrics.marginTopPx, metrics.bodyWidthPx(),
+                               metrics.bodyHeightPx());
+        QPainterPath windowPath;
+        windowPath.setFillRule(Qt::OddEvenFill);
+        windowPath.addRect(bodyLocal);
+        for (int n = pageBlocks.first; n <= pageBlocks.second; ++n) {
+            const QVector<EffectDrawItem> &items = planner.items(n);
+            for (const EffectDrawItem &item : items) {
+                if (!item.hidden)
+                    continue;
+                const QRectF shifted =
+                    item.charRect.translated(0.0, -double(page) * metrics.paperHeightPx);
+                if (shifted.intersects(bodyLocal))
+                    windowPath.addRect(shifted);
+            }
+        }
 
         QAbstractTextDocumentLayout::PaintContext context;
         context.palette.setColor(QPalette::Text, Qt::black);
-        /*!
-         * "这一页的正文窗口"必须**总是**设上：
-         *
-         * 这里的分页高度取的是正文区高度，页与页的正文区在文档坐标里是
-         * **紧挨着**排的（`-page * 正文高`），不留纸高那段空档 ——
-         * 所以上一页最后一行的下伸部、以及"上下边距"的留白，都只能靠这个
-         * 裁剪窗口挡住。不设的话页与页之间会互相看到对方的字
-         * （屏幕上那条路本来就是每页 `setClipRect(正文区)`，两边要对齐）。
-         * 这一条路径同时也是"挖洞"（被效果整格替换的格子不画原字）。
-         */
+        // 可见范围（文档坐标）：渲染层据此跳过看不见的段落
+        context.clip = metrics.bodyRect(page);
+
         painter->setClipPath(windowPath, Qt::IntersectClip);
-        document->documentLayout()->draw(painter, context);
+        layout->draw(painter, context);
 
         if (options.anyLayer()) {
             /*!
-             * 画效果层之前**必须先去掉"挖洞"的裁剪**。
+             * 画效果层之前**必须先去掉“挖洞”的裁剪**。
              *
              * 洞的位置就是会被效果字形替换掉的那些格子 —— 也就是效果层要画的地方。
              * 带着这套裁剪去画效果层，等于把新字形也一起裁掉：原字没了、新字也没了。
-             * 屏幕那条路径早就这么处理了（见 TextEditor::paintEvent 里的
-             * setClipping(false) 与那段注释），导出这一路漏了这一步，
-             * 结果是**屏幕上好好的、导出的 PDF / 图片里手写笔迹几乎全没了**。
-             * 保留下来的只有恰好越过格子边界的那几笔，看着像几个碎竖条。
-             *
-             * 换成普通的"正文窗口"裁剪：效果层不该画到页边距外面去。
+             * 换成普通的“正文窗口”裁剪：效果层不该画到页边距外面去。
              */
             painter->setClipping(false);
-            painter->setClipRect(QRectF(QPointF(0.0, 0.0), cardPx));
+            QPainterPath bodyOnly;
+            bodyOnly.addRect(bodyLocal);
+            painter->setClipPath(bodyOnly);
             EffectRenderOptions local = options;
             local.missing.clear();
-            renderEffects(painter, document, local);
+            for (int n = pageBlocks.first; n <= pageBlocks.second; ++n)
+                renderPreparedEffects(painter, planner.items(n), local);
         }
+
+        // 页眉页脚：和屏幕上同一段代码（默认都不显示）
+        layout->drawChrome(painter, page, QPalette());
 
         painter->restore();
     }
 
     painter->restore();
+
+    /*!
+     * 打印是“借用”文档的版面：算完还给编辑时那一套。
+     * 不还的话，打印完屏幕上的分页就变成了打印机纸张的分页
+     * （换台打印机，屏幕上的断行就变了 —— 这种事发生一次就够吓人的）。
+     *
+     * 本来就没版面（独立文档：自检渲染、导出图片）时就把这一套留着 ——
+     * 还成“无效”的话文档就再也没法算几何了，blockBoundingRect 全变成空矩形。
+     */
+    if (savedMetrics.isValid())
+        layout->setMetrics(savedMetrics);
+    layout->setChrome(savedChrome);
 }
 
 /*!
@@ -195,6 +258,45 @@ static QRect inkBoundsOf(const QImage &image)
 }
 
 /*!
+ * \brief 等效果层的几何算完（自检用）。
+ *
+ * 效果几何是**后台分片算**的（见 effectplanner.h）：套上效果的头几帧，
+ * 原字照旧画着（那时还没挖洞），算好了才一片一片换成扭曲字形/手写笔迹。
+ * 自检要量"最终样子"，所以得先等它安静下来 —— 而且无头环境不会主动派发
+ * 绘制事件，而"哪些格子要算几何"正是绘制时决定的，所以这里还要主动推重绘。
+ */
+static void windowSettleEffects(MainWindow &window, int timeoutMs = 5000)
+{
+    auto *editor = window.findChild<TextEditor *>();
+    if (!editor || !editor->effectPlanner())
+        return;
+
+    EffectPlanner *planner = editor->effectPlanner();
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < timeoutMs) {
+        editor->viewport()->repaint();  // 让"看得见的这几页"登记进来
+        planner->requestGeometry();     // 不等 150ms 的"安静"了
+        while (planner->work(64)) { }
+        bool ready = true;
+        const QPair<int, int> range = editor->layout()->blockRangeOnPages(0, 9999);
+        for (int n = range.first; n <= range.second && ready; ++n) {
+            for (const EffectDrawItem &item : planner->items(n)) {
+                if (!item.geometryDone) {
+                    ready = false;
+                    break;
+                }
+            }
+        }
+        if (ready && !planner->hasPendingWork())
+            break;
+        QApplication::processEvents();
+    }
+    QApplication::processEvents();
+}
+
+/*!
+ * 无界面自检：把文档渲染成一张 PNG，用来验证
  * 数出 \a rect 范围内有多少墨点（用来验证"该有字的地方真的有字"）。
  */
 static int inkPixelsIn(const QImage &image, const QRect &rect)
@@ -417,10 +519,17 @@ static int runSelfTest(const QStringList &args)
             const QVector<EffectDrawItem> probeItems = planEffects(&probe, probeOptions);
             if (!probeItems.isEmpty()) {
                 const QRectF cell = probeItems.first().charRect;
-                const QMarginsF marginsPx = setup.bodyMarginsPx();
                 const double toDevice = dpi / PageSetup::kDpi;
-                const QRect dev(int((cell.left() + marginsPx.left()) * toDevice),
-                                int((cell.top() + marginsPx.top()) * toDevice),
+                /*!
+                 * 格子坐标**已经是纸面坐标**（含页边距），所以直接乘设备比例就行。
+                 *
+                 * 这里曾经又加了一遍 `marginsPx` —— 那是旧模型（文档坐标 = 正文坐标）
+                 * 留下的写法。旧模型下多算一次刚好落回格子上，新模型下等于把量尺
+                 * 往右下方挪了一个页边距，量到的是一片空白：
+                 * “格子里 0 个墨点”看起来像导出丢笔迹，实际上是**自检量错了地方**。
+                 */
+                const QRect dev(int(cell.left() * toDevice),
+                                int(cell.top() * toDevice),
                                 int(cell.width() * toDevice),
                                 int(cell.height() * toDevice));
                 const int inside = inkPixelsIn(renderProbe(), dev);
@@ -796,6 +905,8 @@ static int runZoomProbe(MainWindow &window, const QString &outDir)
     const double paper0 = editor->paperViewWidthPx();
     const double pad0 = editor->paperPadPx();
     const QPointF origin0 = editor->documentOriginInViewport();
+    // 纸面原点里本来就含滚动量：比“几何还原”时要把它减掉（滚动是另一回事）
+    const int scroll0 = editor->verticalScrollBar()->value();
 
     int span0Left = 0;
     int span0Right = 0;
@@ -1040,8 +1151,25 @@ static int runZoomProbe(MainWindow &window, const QString &outDir)
         const double dpr = window.devicePixelRatioF();
         const QPointF docOrigin = editor->documentOriginInViewport();
         const double docY = editor->document()->documentLayout()->blockBoundingRect(block).top();
-        const double wantTop = docOrigin.y() + docY; // viewport 局部坐标
-        const double wantLeft = docOrigin.x();
+        /*!
+         * 期望位置一律用**那一个变换**（documentToViewport）算。
+         *
+         * 手算“纸面原点 + 页边距 + 滚动量”看着简单，但文档坐标改成纸面
+         * 口径（原点 = 纸的左上角）之后，`blockBoundingRect().top()`
+         * 里就已经含了正文上边距 —— 再用“正文原点 + 文档 y”去算，
+         * 上边距就被算了两遍（这里真踩过：光标明明画对了，量的时候找不到）。
+         */
+        /*!
+         * 期望位置一律用**那一个变换**（documentToViewport）算 ——
+         * 文档坐标 = 纸面坐标，所以“文档原点 + 页边距 + 滚动量”那种手算
+         * 迟早会多算/少算一项（这里真踩过：正文上边距被算了两遍）。
+         * 横向也要用块自己的左边界：光标在正文左边距上，不是纸的左边。
+         */
+        const QRectF blockRect = editor->document()->documentLayout()->blockBoundingRect(block);
+        const QPointF wantPoint =
+            editor->documentToViewport().map(QPointF(blockRect.left(), docY));
+        const double wantTop = wantPoint.y(); // viewport 局部坐标
+        const double wantLeft = wantPoint.x();
         QTextStream(stdout) << "zoom: [光标量测] 正文原点 y=" << docOrigin.y()
                             << " 第 20 段文档 y=" << docY << " 预期(view 局部) y=" << wantTop
                             << " 滚动=" << editor->verticalScrollBar()->value() << "/"
@@ -1190,7 +1318,9 @@ static int runZoomProbe(MainWindow &window, const QString &outDir)
 
     if (qAbs(editor->paperViewWidthPx() - paper0) > 0.5
         || qAbs(editor->paperPadPx() - pad0) > 1.5
-        || qAbs(editor->documentOriginInViewport().y() - origin0.y()) > 1.0) {
+        // 减掉滚动量再比：缩放只该改几何，不该把“滚到哪儿”也算进去
+        || qAbs((editor->documentOriginInViewport().y() + editor->verticalScrollBar()->value())
+                - (origin0.y() + scroll0)) > 1.0) {
         QTextStream(stderr) << "zoom 失败：回到 100% 之后几何没还原（纸宽 "
                             << editor->paperViewWidthPx() << " 留白 " << editor->paperPadPx()
                             << "）\n";
@@ -1257,9 +1387,19 @@ static int runHandwritingNoiseProbe(MainWindow &window, const QString &outDir)
         const QTextBlock block = editor->document()->firstBlock();
         const QRectF blockRect = editor->document()->documentLayout()->blockBoundingRect(block);
         const QPoint vpInWindow = editor->viewport()->mapTo(&window, QPoint(0, 0));
-        const QPointF origin = QPointF(vpInWindow) + editor->documentOriginInViewport();
         const double dpr = window.devicePixelRatioF();
-        const QRectF band(origin.x() - 4.0, origin.y() + blockRect.top() - 2.0,
+        /*!
+         * 位置一律走 documentToViewport()（文档坐标 -> 屏幕）。
+         *
+         * 以前是“文档原点 + blockRect.top()”手算，那时文档原点是**正文左上角**，
+         * 正好对得上；现在文档原点是**纸的左上角**（见 paginatinglayout.h），
+         * 同一个手算就漏掉了一个页边距 —— 量到的是纸边上的空白，
+         * 看着就像“一个字都没画”。
+         */
+        const QPointF origin =
+            QPointF(vpInWindow)
+            + editor->documentToViewport().map(QPointF(blockRect.left(), blockRect.top()));
+        const QRectF band(origin.x() - 4.0, origin.y() - 2.0,
                           qMax(60.0, blockRect.width()) + 14.0, blockRect.height() + 8.0);
         *rect = QRect(int(band.left() * dpr), int(band.top() * dpr), int(band.width() * dpr),
                       int(band.height() * dpr));
@@ -1421,6 +1561,411 @@ static int runHandwritingNoiseProbe(MainWindow &window, const QString &outDir)
 
     QTextStream(stdout) << "hwnoise: 手写加噪声自检通过（手写保留、机打字不回来、"
                            "普通文字照旧扭曲字形）\n";
+    return 0;
+}
+
+/*!
+ * \brief 长活儿自检：阻塞式操作必须变成"分片 + 进度条 + 可取消"。
+ *
+ * 用户报的问题是"写着写着就卡"：给整篇加噪声、铺手写这类操作原来是一口气跑完的
+ * （两千字 78ms，两万字 800ms），期间窗口完全没响应。
+ *
+ * 这里量的是**行为**，不是实现：
+ *   1. 动作一触发就返回（不阻塞在菜单回调里）；
+ *   2. 任务进行期间事件循环还在转（挂一个 0 间隔心跳数次数）；
+ *   3. 状态栏上真的出现了进度条，而且百分比在走；
+ *   4. 干完之后编辑器恢复可编辑（临时只读必须被恢复，否则"打完字不能编辑"）；
+ *   5. Esc 能取消，而且**取消 = 什么都没发生**（效果字符数回到 0）。
+ */
+static int runProgressProbe(MainWindow &window, const QString &outDir)
+{
+    TextEditor *editor = window.findChild<TextEditor *>();
+    if (!editor) {
+        QTextStream(stderr) << "progress 失败：找不到编辑区\n";
+        return 70;
+    }
+
+    QProgressBar *bar = window.findChild<QProgressBar *>(QStringLiteral("jobBar"));
+    QLabel *label = window.findChild<QLabel *>(QStringLiteral("jobLabel"));
+    if (!bar || !label) {
+        QTextStream(stderr) << "progress 失败：状态栏上没有进度条 / 任务名标签\n";
+        return 71;
+    }
+
+    // 数一份文档里有多少字符带着效果
+    auto effectChars = [editor]() {
+        int n = 0;
+        QTextDocument *doc = editor->document();
+        for (QTextBlock b = doc->begin(); b.isValid(); b = b.next()) {
+            for (QTextBlock::iterator it = b.begin(); !it.atEnd(); ++it) {
+                const QTextFragment f = it.fragment();
+                if (!f.isValid())
+                    continue;
+                if (effectStyle(f.charFormat()).isValid())
+                    n += f.text().size();
+            }
+        }
+        return n;
+    };
+
+    // 一段够长的稿子：两千字以上，任务一定会跨很多片
+    {
+        QStringList lines;
+        for (int i = 0; i < 200; ++i)
+            lines << QStringLiteral("进度自检第%1行，正文内容正文内容正文内容")
+                         .arg(i + 1, 2, 10, QLatin1Char('0'));
+        editor->setCurrentCharFormat(QTextCharFormat());
+        editor->setPlainText(lines.join(QLatin1Char('\n')));
+        QTextCursor all = editor->textCursor();
+        all.select(QTextCursor::Document);
+        editor->setTextCursor(all);
+        /*!
+         * 视口滚回开头，但**选区必须留着**。
+         *
+         * 不能用 `moveCursor(QTextCursor::Start)`：那会把选区清掉，
+         * 于是动作里那句"请先选中一段文字"就弹出来了 —— 而这是个模态对话框，
+         * 它的嵌套事件循环会把整轮自检卡死（实测卡了 350 秒、中途撺了 600 次重绘）。
+         * 保留锚点、只把插入点移到开头，既滚到了顶又没动选区。
+         */
+        /*!
+         * 注意 `QTextCursor::setPosition(0, KeepAnchor)` 在光标**已经在 0** 时
+         * 会把锚点也拉到 0（选区塔掉）—— 实测就是这么丢的选区。
+         * 所以先让锚点落在文档末尾，再带着锚点移到开头。
+         */
+        QTextCursor top(editor->document());
+        top.setPosition(editor->document()->characterCount() - 1);
+        top.setPosition(0, QTextCursor::KeepAnchor);
+        editor->setTextCursor(top);
+        editor->verticalScrollBar()->setValue(0);
+        QTextStream(stdout) << "ui-test: progress 选前状态 选区="
+                            << (editor->textCursor().hasSelection() ? 1 : 0) << " ["
+                            << editor->textCursor().selectionStart() << ".."
+                            << editor->textCursor().selectionEnd() << "] 只读="
+                            << (editor->isReadOnly() ? 1 : 0) << "\n";
+    }
+    for (int i = 0; i < 10; ++i)
+        QApplication::processEvents();
+
+    QAction *distort = window.findChild<QAction *>(QStringLiteral("act_distort"));
+    if (!distort) {
+        QTextStream(stderr) << "progress 失败：找不到「笔画扭曲」动作\n";
+        return 72;
+    }
+    /*!
+     * 没选区就会弹一个模态对话框，而它的嵌套事件循环会把自检整个卡住。
+     * 所以这里先自己确认一下：真没选区是**自检的错**，早报早好。
+     */
+    if (!editor->textCursor().hasSelection()) {
+        QTextStream(stderr) << "progress 失败：触发动作之前没有选区（会弹模态对话框卡住）\n";
+        return 72;
+    }
+
+    /*!
+     * 心跳：任务期间事件循环每转一圈就 +1。
+     * 这是"界面还活着"唯一能直接量到的证据 —— 同步跑完的活儿心跳只会是 0 或 1。
+     */
+    int ticks = 0;
+    QTimer heartbeat;
+    heartbeat.setInterval(0);
+    QObject::connect(&heartbeat, &QTimer::timeout, [&ticks] { ++ticks; });
+    heartbeat.start();
+
+    QElapsedTimer actionClock;
+    actionClock.start();
+    distort->trigger();
+    const double triggerMs = actionClock.nsecsElapsed() / 1e6;
+    if (triggerMs > 50.0) {
+        QTextStream(stderr) << "progress 失败：动作回调里就卡了 " << triggerMs
+                            << "ms（应当立刻返回，活交给后台分片）\n";
+        return 73;
+    }
+
+    // 等任务跑完：心跳在转，同时把状态栏上看到的进度都记下来
+    int maxPercent = 0;
+    int barVisibleTicks = 0;
+    qint64 worstIterationMs = 0;
+    int labelChanges = 0;
+    int loopCount = 0;
+    QString lastLabel;
+    QStringList seenLabels;
+    QElapsedTimer wait;
+    wait.start();
+    while (wait.elapsed() < 20000) {
+        QElapsedTimer iteration;
+        iteration.start();
+        QApplication::processEvents();
+        if (bar->isVisible()) {
+            ++barVisibleTicks;
+            maxPercent = qMax(maxPercent, bar->value() * 100 / qMax(1, bar->maximum()));
+        }
+        if (label->text() != lastLabel) {
+            lastLabel = label->text();
+            ++labelChanges;
+            if (seenLabels.size() < 6)
+                seenLabels.append(lastLabel);
+        }
+        /*!
+         * 什么时候算完了：套完效果 **+ 看得见的格子几何都算好了**。
+         *
+         * 两个都要等：套格式只是第一段（很快），真正长的是后面
+         * 把可见页那几百个字的字形算出来（要进度条的就是那一段）。
+         * 而"队列空了"不等于"算完了"—— 刚套完效果的那 150ms 里
+         * 几何还排在"等安静"的定时器上，队列本来就是空的。
+         */
+        if (effectChars() > 0 && !editor->isReadOnly() && wait.elapsed() > 300) {
+            bool ready = true;
+            if (loopCount++ % 10 == 0) {
+                const QPair<int, int> range = editor->layout()->blockRangeOnPages(0, 0);
+                for (int n = range.first; n <= range.second && ready; ++n) {
+                    for (const EffectDrawItem &item : editor->effectPlanner()->items(n)) {
+                        /*!
+                         * 看 `geometryDone` 而不是 `art.ready`：
+                         * "算过了但算不出来"（格子无效、缺手写数据）是合法结局，
+                         * 没结局的只有一种 —— 还没算。
+                         */
+                        if (!item.geometryDone) {
+                            ready = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                ready = false;
+            }
+            if (ready)
+                break;
+        }
+
+        /*!
+         * 无头环境里窗口没有被"暴露"，Qt 不会主动派发绘制事件 ——
+         * 而"看得见的这一页要算几何"这个决定是**绘制时**做的（见 paintEvent）。
+         * 所以这里主动推一下重绘，模拟"用户正看着这一页"。
+         */
+        if (loopCount % 5 == 0)
+            editor->viewport()->repaint();
+        QThread::msleep(2);
+        worstIterationMs = qMax(worstIterationMs, iteration.elapsed());
+    }
+    heartbeat.stop();
+    const qint64 totalMs = wait.elapsed();
+    if (EffectPlanner *planner = editor->effectPlanner()) {
+        QTextStream(stdout) << "ui-test: progress 几何状态：已算 " << planner->preparedItemCount()
+                            << " 项 / 待算 " << planner->pendingItemCount() << " 项（规划了 "
+                            << planner->plannedBlockCount() << " 段，编辑区可见="
+                            << (editor->viewport()->isVisible() ? 1 : 0) << "）\n";
+    }
+
+    const int applied = effectChars();
+    QTextStream(stdout) << "ui-test: progress 套扭曲：动作回调 " << triggerMs
+                        << "ms，任务共 " << totalMs << "ms（单次 processEvents 最长 "
+                        << worstIterationMs << "ms），心跳 " << ticks << " 次，进度条最高 "
+                        << maxPercent << "%（可见 " << barVisibleTicks << " 次，文案变了 "
+                        << labelChanges << " 次），效果字符 " << applied << "\n";
+    for (const QString &text : std::as_const(seenLabels))
+        QTextStream(stdout) << "ui-test: progress 状态栏文案：" << text << "\n";
+
+    if (ticks < 5) {
+        QTextStream(stderr) << "progress 失败：任务期间事件循环几乎没转（心跳 " << ticks
+                            << "）—— 还是阻塞式\n";
+        return 74;
+    }
+    /*!
+     * 进度条是"晚点出现"的（250ms）：任务很快的时候弹一下再消失比不弹还刺眼。
+     * 所以只有任务真的跑久了，才要求它出现过。
+     */
+    if (totalMs > 1000 && (barVisibleTicks == 0 || labelChanges < 2)) {
+        QTextStream(stderr) << "progress 失败：跑 " << totalMs
+                            << "ms 的任务居然没弹出进度（可见 " << barVisibleTicks
+                            << " 次，文案变了 " << labelChanges << " 次）\n";
+        return 75;
+    }
+    if (labelChanges == 0) {
+        QTextStream(stderr) << "progress 失败：状态栏上一条进度都没报\n";
+        return 75;
+    }
+    if (worstIterationMs > 200) {
+        QTextStream(stderr) << "progress 失败：单次事件循环花了 " << worstIterationMs
+                            << "ms —— 还有一段是同步跑的\n";
+        return 75;
+    }
+    /*!
+     * 选区必须还在。
+     *
+     * 用户看到的症状：选一段字、点【笔画扭曲】、完事之后再点一次，
+     * 弹出来"请先选中一段文字"—— 而眼里那段字明明还高亮着。
+     * 原因是任务开工前的 `setReadOnly(true)` 把选区丢了（见 beginJobEdit）。
+     */
+    if (!editor->textCursor().hasSelection()) {
+        QTextStream(stderr)
+            << "progress 失败：干完活之后选区丢了（再点一次就会弹「请先选中一段文字」）\n";
+        return 76;
+    }
+
+    if (applied == 0 || editor->isReadOnly()) {
+        QTextStream(stderr) << "progress 失败：任务没干完或者编辑器还锁着（只读="
+                            << (editor->isReadOnly() ? 1 : 0) << "）\n";
+        return 76;
+    }
+
+    // 几何也要真的算好：效果层画得出来才算数
+    {
+        EffectPlanner *planner = editor->effectPlanner();
+        int ready = 0;
+        int items = 0;
+        const QPair<int, int> range = editor->layout()->blockRangeOnPages(0, 0);
+        planner->beginFrame();
+        planner->requestRange(range.first, range.second);
+        QElapsedTimer geo;
+        geo.start();
+        while (planner->hasPendingWork() && geo.elapsed() < 10000) {
+            planner->work(64);
+            QApplication::processEvents();
+        }
+        int attempted = 0;
+        for (int n = range.first; n <= range.second; ++n) {
+            for (const EffectDrawItem &item : planner->items(n)) {
+                ++items;
+                if (item.art.ready)
+                    ++ready;
+                if (item.geometryDone)
+                    ++attempted;
+            }
+        }
+        QTextStream(stdout) << "ui-test: progress 第 1 页几何：算了 " << attempted << "/" << items
+                            << " 项，其中能画 " << ready << " 项（" << geo.elapsed() << "ms，段 "
+                            << range.first << ".." << range.second << "）\n";
+        if (items == 0 || attempted != items || ready == 0) {
+            QTextStream(stderr) << "progress 失败：第一页还有格子的几何没算好（算了 " << attempted
+                                << "/" << items << "）\n";
+            return 77;
+        }
+    }
+
+    /*!
+     * 取消：取消必须**停在分片边界并且什么都没留下**。
+     *
+     * 做法是先把整篇的效果清掉，再套一次然后立刻取消；
+     * 结果是"效果字符数为 0"——这正是 EffectStyleJob::finish() 里写回原格式那一段。
+     */
+    {
+        QTextCursor all = editor->textCursor();
+        all.select(QTextCursor::Document);
+        editor->setTextCursor(all);
+        clearEffects(&all);
+        editor->setTextCursor(all);
+        for (int i = 0; i < 10; ++i)
+            QApplication::processEvents();
+        const int before = effectChars();
+        /*!
+         * 取消走**状态栏上那个 ✕ 按钮**（用户看得见、点得到的那条路）。
+         *
+         * 为什么不发 Esc：快捷键是 QShortcut 的活，它要经过
+         * QApplication 的快捷键分派（无头环境下窗口不是 active window，分派不成立），
+         * 直接 sendEvent 一个 QKeyEvent 是**绕过**那套机制的，测不到真东西。
+         */
+        QToolButton *cancelButton = window.findChild<QToolButton *>(QStringLiteral("jobCancel"));
+        if (!cancelButton) {
+            QTextStream(stderr) << "progress 失败：状态栏上没有取消按钮\n";
+            return 79;
+        }
+
+        int cancelTicks = 0;
+        QTimer cancelHeartbeat;
+        cancelHeartbeat.setInterval(0);
+        QObject::connect(&cancelHeartbeat, &QTimer::timeout, [&cancelTicks] { ++cancelTicks; });
+        cancelHeartbeat.start();
+
+        distort->trigger();
+        // 让它跑几片（进度条动起来）再取消
+        QElapsedTimer run;
+        run.start();
+        while (run.elapsed() < 40) {
+            QApplication::processEvents();
+            QThread::msleep(1);
+        }
+        cancelButton->click();
+
+        bool stoppedClean = false;
+        while (run.elapsed() < 5000) {
+            QApplication::processEvents();
+            if (!editor->isReadOnly() && effectChars() == 0) {
+                stoppedClean = true;
+                break;
+            }
+            QThread::msleep(2);
+        }
+        cancelHeartbeat.stop();
+
+        const int after = effectChars();
+        QTextStream(stdout) << "ui-test: progress 取消：取消前 " << before << " 个效果字符，"
+                            << "取消后 " << after << " 个，心跳 " << cancelTicks << " 次，只读="
+                            << (editor->isReadOnly() ? 1 : 0) << "\n";
+        if (!stoppedClean || after != 0 || editor->isReadOnly()) {
+            QTextStream(stderr) << "progress 失败：取消应当把改动全部收回（还剩 " << after
+                                << " 个效果字符，只读=" << (editor->isReadOnly() ? 1 : 0) << "）\n";
+            return 78;
+        }
+    }
+
+    /*!
+     * 用户点名要的那一条：**没选中文字时，直接作用于全文，不再弹窗**。
+     *
+     * 从前这里会弹一个模态对话框"请先选中一段文字" —— 用户的原话是
+     * "还是有这个弹窗"。现在：没有选区 = 全文，状态栏明说一句。
+     *
+     * 量法：先把选区收起来（光标只是一个插入点），再点【笔画扭曲】，
+     * 看是不是**全文**都被扭曲了、而且回调准时返回（没弹窗就不会被嵌套
+     * 事件循环卡住）。
+     */
+    {
+        QTextCursor caret = editor->textCursor();
+        caret.clearSelection();
+        caret.setPosition(editor->document()->characterCount() / 2);
+        editor->setTextCursor(caret);
+        QApplication::processEvents();
+
+        QTextCursor all = editor->textCursor();
+        all.select(QTextCursor::Document);
+        editor->setTextCursor(all);
+        clearEffects(&all);
+        editor->setTextCursor(caret);
+        for (int i = 0; i < 10; ++i)
+            QApplication::processEvents();
+
+        QElapsedTimer clock;
+        clock.start();
+        distort->trigger();
+        const double ms = clock.nsecsElapsed() / 1e6;
+
+        QElapsedTimer run;
+        run.start();
+        while (run.elapsed() < 15000) {
+            QApplication::processEvents();
+            if (effectChars() > 0 && !editor->isReadOnly())
+                break;
+            QThread::msleep(2);
+        }
+
+        const int covered = effectChars();
+        const int total = qMax(0, editor->document()->characterCount() - 1);
+        QTextStream(stdout) << "ui-test: progress 无选区：回调 " << ms << "ms，任务 " << run.elapsed()
+                            << "ms，扭曲了 " << covered << " 个字符（可铺字的格子约 " << total
+                            << " 个）\n";
+        if (ms > 300.0) {
+            QTextStream(stderr) << "progress 失败：没选区时动作里卡了 " << ms
+                                << "ms（可能又弹模态窗了）\n";
+            return 80;
+        }
+        // 全文兜底：覆盖的字符数必须远超“当前视口”那一页的量
+        if (covered < total / 2) {
+            QTextStream(stderr) << "progress 失败：没选区时应当作用于全文，实际只动了 " << covered
+                                << " 个字符（全文约 " << total << "）\n";
+            return 81;
+        }
+    }
+
+    QTextStream(stdout) << "ui-test: progress 长活儿自检通过（分片、进度、可取消、收尾恢复、无选区=全文）\n";
+    Q_UNUSED(outDir);
     return 0;
 }
 
@@ -1661,6 +2206,77 @@ static int runPageLayoutProbe(MainWindow &window, const QString &outDir)
     }
 
     /*!
+     * 二、像真的打字那样：一边打一边看"纸与纸之间那道缝"
+     *     —— 第 2 页上冒出第 1 页的字，必然先表现为**缝里有墨**。
+     *
+     * 量法：把视口滚到"第 1 页的下边距 + 纸缝"都看得见的位置，
+     * 然后在**缝那几行**上找墨。纸缝里除了桌面什么都没有，
+     * 一旦出现非桌面色的像素，就说明有东西被画到纸外面去了
+     * （老代码里第 2 页画的是文档开头，正是从缝里开始冒出来的）。
+     */
+    {
+        editor->setZoom(1.0);
+        editor->verticalScrollBar()->setValue(0);
+        editor->setCurrentCharFormat(QTextCharFormat());
+        QStringList lines;
+        for (int i = 0; i < 30; ++i)
+            lines << QStringLiteral("第一页第%1行").arg(i + 1);
+        editor->setPlainText(lines.join(QLatin1Char('\n')));
+        editor->moveCursor(QTextCursor::Start);
+        settle();
+
+        const double nowPaperH = editor->paperViewHeightPx();
+        // 让"第 1 页的底边"落在视口中间：滚动值 = 纸高 - 视口高/2
+        const int want = int(std::lround(nowPaperH - editor->viewport()->height() / 2.0));
+        editor->verticalScrollBar()->setValue(qBound(0, want, editor->verticalScrollBar()->maximum()));
+        settle();
+
+        const QImage shot = grabViewport();
+        const double dprNow = window.devicePixelRatioF();
+        const QPoint paperAt = editor->paperOriginInViewport().toPoint();
+        const double paperTopInView = paperAt.y(); // 第 1 页纸顶在视口里的 y
+        const QColor desk(0x3a, 0x3d, 0x42);
+
+        int gapInk = 0;
+        int widest = 0;
+        {
+            // 纸缝：第 1 页纸底 .. 第 2 页纸顶（含第 2 页纸顶以上的桌面）
+            const int gapTop = int(std::lround((paperTopInView + nowPaperH) * dprNow)) + 6;
+            const int gapBottom =
+                int(std::lround((paperTopInView + 2 * nowPaperH) * dprNow)) - 2;
+            const int x0 = qMax(0, int(std::lround((paperAt.x() + 10) * dprNow)));
+            const int x1 = qMin(shot.width() - 1,
+                                int(std::lround((paperAt.x() + editor->paperViewWidthPx() - 10)
+                                                * dprNow)));
+            for (int y = qMax(0, gapTop); y <= qMin(shot.height() - 1, gapBottom); ++y) {
+                int row = 0;
+                for (int x = x0; x <= x1; ++x) {
+                    const QRgb c = shot.pixel(x, y);
+                    // 桌面色（含阴影）之外的都算"不该出现在缝里的东西"
+                    if (qAbs(qRed(c) - desk.red()) > 12 || qAbs(qGreen(c) - desk.green()) > 12
+                        || qAbs(qBlue(c) - desk.blue()) > 12)
+                        ++row;
+                }
+                if (row > 0) {
+                    gapInk += row;
+                    widest = qMax(widest, row);
+                }
+            }
+            QTextStream(stdout) << "pagefix: 纸缝检查 滚动=" << editor->verticalScrollBar()->value()
+                                << " 纸顶=" << paperTopInView << " 缝(设备像素)=" << gapTop << ".."
+                                << gapBottom << " 缝里的非桌面像素=" << gapInk
+                                << "（最宽一行 " << widest << "）\n";
+            shot.save(outDir + QStringLiteral("/uitest_pagefix_gap.png"));
+        }
+        if (gapInk > 200) {
+            QTextStream(stderr) << "pagefix 失败：两张纸之间的缝里有 " << gapInk
+                                << " 个像素不是桌面色 —— 有内容被画到纸外面去了"
+                                   "（第 2 页上又冒出第 1 页的字，就是这个症状）\n";
+            return 66;
+        }
+    }
+
+    /*!
      * 二、100%：一页纸比视口高，只能看一部分，判据是"墨别越出正文区"。
      */
     editor->setZoom(1.0);
@@ -1793,6 +2409,315 @@ static int runPageLayoutProbe(MainWindow &window, const QString &outDir)
 
 
 /*!
+ * \brief 折腾自检（soak）：像真人那样一直打字 + 拉窗口 + 缩放，边折腾边记日志。
+ *
+ * 这一组不是"断言某个数对不对"，而是**把用户报的"打字/缩放时随机崩"
+ * 搬到自检里来**：每种操作都做成一个函数，一轮一轮随机组合着跑；
+ * 每步之前写一条面包屑、每步之后写一条日志。只要它崩了，
+ * `--log=debug` 的日志 + 崩溃 dump 里就能看到崩在哪种组合上。
+ *
+ * 跑法：`tripa.exe --uitest <目录> light soak --log=debug`
+ *
+ * \a rounds 默认 200 轮；每轮都做"打字 1~8 个字符"，再按轮次轮换做
+ * 改窗口大小 / 改缩放 / 翻到文档头尾 / 改页面设置。
+ */
+static int runSoakProbe(MainWindow &window, const QString &outDir, int rounds)
+{
+    TextEditor *editor = window.findChild<TextEditor *>();
+    if (!editor) {
+        QTextStream(stderr) << "soak 失败：找不到编辑区\n";
+        return 70;
+    }
+
+    QTextStream(stdout) << "soak: 开始折腾 " << rounds << " 轮（日志级别见 --log）\n";
+
+    // 起手先放一段有中文有英文的文字，别用空白文档——那种文档什么都测不出来
+    editor->setCurrentCharFormat(QTextCharFormat());
+    editor->setPlainText(QStringLiteral("折腾自检起点 abc 123 排版\n"));
+    editor->moveCursor(QTextCursor::End);
+    editor->setFocus(Qt::OtherFocusReason);
+    editor->setZoom(1.0);
+
+    auto pump = [](int times = 3) {
+        for (int i = 0; i < times; ++i) {
+            QApplication::processEvents();
+            QThread::msleep(1);
+        }
+    };
+
+    const int widths[] = {1360, 900, 1600, 700, 1200};
+    const double zooms[] = {1.0, 0.5, 1.5, 0.25, 2.0, 0.75, 4.0, 1.0};
+    int typed = 0;
+    int maxPages = 1;
+
+    for (int round = 0; round < rounds; ++round) {
+        tripalog::breadcrumb(QStringLiteral("soak 第 %1 轮：开始").arg(round + 1));
+
+        // --- 打字：1~8 个字符，偶尔回车换段
+        {
+            const int count = 1 + (round * 7) % 8;
+            tripalog::breadcrumb(QStringLiteral("soak 第 %1 轮：打字 %2 个").arg(round + 1).arg(count));
+            QTextCursor c = editor->textCursor();
+            c.movePosition(QTextCursor::End);
+            for (int k = 0; k < count; ++k) {
+                if (k == 3 && round % 3 == 0)
+                    c.insertBlock();
+                c.insertText(QStringLiteral("管%1").arg(typed + k + 1));
+            }
+            editor->setTextCursor(c);
+            typed += count;
+            pump();
+        }
+
+        // --- 每轮都动的东西：光标滚进视口（打字的人眼睛盯着光标）
+        editor->ensureCaretVisible();
+        pump(2);
+
+        // --- 轮换：改窗口大小（最容易踩到重排 + 滚动范围重算）
+        if (round % 4 == 1) {
+            const int w = widths[(round / 4) % 5];
+            const int h = 620 + (round % 5) * 70;
+            tripalog::breadcrumb(QStringLiteral("soak 第 %1 轮：改窗口 %2x%3")
+                                     .arg(round + 1).arg(w).arg(h));
+            window.resize(w, h);
+            pump(4);
+        }
+
+        // --- 轮换：改缩放（每页几何都要重算）
+        if (round % 5 == 2) {
+            const double z = zooms[(round / 5) % 8];
+            tripalog::breadcrumb(QStringLiteral("soak 第 %1 轮：缩放 %2%")
+                                     .arg(round + 1).arg(int(z * 100)));
+            editor->setZoom(z);
+            pump(4);
+        }
+
+        // --- 轮换：在文档里乱跳（光标、滚动条、选区一起动）
+        if (round % 7 == 3) {
+            tripalog::breadcrumb(QStringLiteral("soak 第 %1 轮：跳光标/滚动").arg(round + 1));
+            const int max = qMax(1, editor->document()->characterCount() - 1);
+            const int pos = (round * 37) % max;
+            QTextCursor c(editor->document());
+            c.setPosition(pos);
+            if (round % 2 == 0) {
+                const int end = qMin(max, pos + 20 + round % 50);
+                c.setPosition(end, QTextCursor::KeepAnchor);
+            }
+            editor->setTextCursor(c);
+            editor->ensureCaretVisible();
+            const int range = editor->verticalScrollBar()->maximum();
+            editor->verticalScrollBar()->setValue(range > 0 ? (round * 13) % range : 0);
+            pump(3);
+        }
+
+        /*!
+         * --- 轮换：连续缩放（一路放大再一路缩小）
+         *
+         * 这一条对着"一缩放就崩"那个报告：缩放会同时改绘制变换、
+         * 纸张居中量、滚动范围、光标矩形，还要重排一遍 ——
+         * 是一堆状态里最容易互相踩的一项。
+         */
+        if (round % 6 == 4) {
+            tripalog::breadcrumb(QStringLiteral("soak 第 %1 轮：连续缩放").arg(round + 1));
+            for (int step = 0; step < 6; ++step) {
+                const double z = 0.25 + 0.125 * step; // 25%..87.5%
+                editor->setZoom(z);
+                pump(1);
+            }
+            for (int step = 5; step >= 0; --step) {
+                const double z = 0.25 + 0.125 * step;
+                editor->setZoom(z);
+                pump(1);
+            }
+        }
+
+        // --- 轮换：改页面设置（换纸、换边距 —— 分页模型整个重算）
+        if (round % 11 == 5) {
+            tripalog::breadcrumb(QStringLiteral("soak 第 %1 轮：改页面设置").arg(round + 1));
+            PageSetup setup = editor->pageSetup();
+            if (round % 22 == 5) {
+                setup.presetName = QStringLiteral("A5");
+                setup.widthMm = 148.0;
+                setup.heightMm = 210.0;
+            } else {
+                setup.presetName = QStringLiteral("A4");
+                setup.widthMm = 210.0;
+                setup.heightMm = 297.0;
+            }
+            setup.landscape = (round % 44 == 27);
+            setup.marginTopMm = 10.0 + (round % 4) * 7.0;
+            setup.marginBottomMm = 12.0 + (round % 3) * 9.0;
+            editor->setPageSetup(setup);
+            pump(4);
+        }
+
+        // --- 每轮顺手画一次（把绘制路径也拖进来），偶尔存一张图留证
+        editor->viewport()->repaint();
+        pump(1);
+
+        const double pageH = editor->paperViewHeightPx();
+        const int pages =
+            qMax(1, int(std::ceil(editor->document()->size().height() / qMax(1.0, pageH))));
+        maxPages = qMax(maxPages, pages);
+        if (round % 20 == 19) {
+            TRIPA_INFO("soak",
+                       QStringLiteral("进度：第 %1/%2 轮 字符=%3 页数=%4 缩放=%5% 窗口=%6x%7")
+                           .arg(round + 1)
+                           .arg(rounds)
+                           .arg(editor->document()->characterCount() - 1)
+                           .arg(pages)
+                           .arg(int(std::lround(editor->zoom() * 100.0)))
+                           .arg(window.width())
+                           .arg(window.height()));
+            if (round % 40 == 19)
+                window.grab().save(QStringLiteral("%1/uitest_soak_%2.png")
+                                       .arg(outDir)
+                                       .arg(round + 1));
+        }
+    }
+
+    tripalog::breadcrumb(QStringLiteral("soak 结束"));
+    QTextStream(stdout) << "soak: " << rounds << " 轮跑完，没崩；共键入 " << typed << " 个字符，"
+                        << "最多 " << maxPages << " 页\n";
+    TRIPA_INFO("soak", QStringLiteral("跑完 %1 轮没崩（字符 %2，最多 %3 页）")
+                           .arg(rounds)
+                           .arg(typed)
+                           .arg(maxPages));
+    return 0;
+}
+
+/*!
+ * \brief 崩溃报告自检：**故意崩一次**，然后看有没有 dump 留下来。
+ *
+ * 崩溃处理这条路"平时不走"，所以必须能主动测 —— 否则等用户真的崩了，
+ * 才发现 dump 里什么都没有，那就白做了。用 `RaiseException` 造一个
+ * 访问冲突（不是真空指针解引用：那样编译器可能优化掉，也没法在自检里
+ * 稳定复现），异常码固定成 `0xE0000001` 好认。
+ *
+ * 跑法：`tripa.exe --crashtest`（子进程用），
+ * 或 `--uitest <目录> light crashtest`（父进程拉起子进程再检查 dump）。
+ */
+static int runCrashChild()
+{
+#if defined(Q_OS_WIN)
+    tripalog::breadcrumb(QStringLiteral("崩溃自检：故意制造一次访问冲突"));
+    TRIPA_WARN("crashtest", "日志系统自检 —— 下面这行之后进程会故意崩溃，这是预期的");
+    TRIPA_INFO("crashtest", QStringLiteral("崩溃前日志（应该能在 dump 里看到这一行）"));
+    fprintf(stderr, "crashtest: 即将故意崩溃，dump 应当写到 %s\n",
+            qPrintable(tripalog::dumpDirectory()));
+    fflush(stderr);
+    ::RaiseException(0xE0000001u, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    fprintf(stderr, "crashtest: 居然没崩（RaiseException 被吞了？）\n");
+    return 90;
+#else
+    fprintf(stderr, "crashtest: 这个平台没做崩溃处理\n");
+    return 90;
+#endif
+}
+
+/*!
+ * \brief 在自检里验证崩溃 dump：拉起一个子进程让它崩，再检查 dump 文件。
+ */
+static int runCrashDumpProbe(const QString &outDir)
+{
+#if defined(Q_OS_WIN)
+    const QString exe = QCoreApplication::applicationFilePath();
+
+    /*!
+     * dump 固定写到**自检输出目录**旁边：默认位置是
+     * `%LOCALAPPDATA%/tripa`，而受限沙箱里那个目录可能根本写不进去 ——
+     * 那样测的就成了"沙箱让不让写"，而不是"崩溃处理器对不对"。
+     * 用**命令行参数**（不是环境变量：环境变量在子进程里未必拿得到，
+     * 踩过一次）把子进程的报告目录指到当前工作目录下的临时目录；
+     * 现场（用户机器）用的仍然是默认位置。
+     */
+    const QString logDir = QDir::currentPath() + QStringLiteral("/crashtest_logs");
+    QDir().mkpath(logDir);
+
+    /*!
+     * 用 `_spawnl` 而不是 `QProcess`：`QProcess` 抓子进程输出要开**命名管道**，
+     * 而受限沙箱里那是被拒的（实测报 "pipe: 系统找不到指定的文件"）——
+     * 自检在自己的开发沙箱里跑不起来，就没法验证这条路。子进程不需要
+     * 回传输出（它要写的东西全在 dump 里），所以直接 spawn 最省事。
+     */
+    const QByteArray exeUtf8 = QDir::toNativeSeparators(exe).toLocal8Bit();
+    const QByteArray dirUtf8 = QDir::toNativeSeparators(logDir).toLocal8Bit();
+    errno = 0;
+    const intptr_t pid = _spawnl(_P_NOWAIT, exeUtf8.constData(), exeUtf8.constData(),
+                                 "--crashtest", "--crashdir", dirUtf8.constData(), nullptr);
+    if (pid == -1) {
+        QTextStream(stderr) << "crashtest 失败：起不了子进程（errno=" << errno << "）\n";
+        return 91;
+    }
+    QTextStream(stdout) << "crashtest: 子进程 pid=" << qint64(pid) << "，dump 目录="
+                        << QDir::toNativeSeparators(logDir) << "，等它崩完…\n";
+
+    QDir dir(logDir);
+    QString path;
+    for (int i = 0; i < 100 && path.isEmpty(); ++i) {
+        QThread::msleep(100);
+        const QStringList found =
+            dir.entryList({QStringLiteral("tripa-crash-*.txt")}, QDir::Files, QDir::Time);
+        if (!found.isEmpty())
+            path = dir.absoluteFilePath(found.first());
+    }
+    if (path.isEmpty()) {
+        QTextStream(stderr) << "crashtest 失败：" << QDir::toNativeSeparators(logDir)
+                            << " 里没有 tripa-crash-*.txt（子进程崩了但没写出报告？）\n";
+        return 92;
+    }
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream(stderr) << "crashtest 失败：打不开 dump " << path << "\n";
+        return 93;
+    }
+    const QString text = QString::fromUtf8(file.readAll());
+    file.close();
+    QTextStream(stdout) << "crashtest: dump=" << path << "（" << text.size() << " 字）\n";
+
+    // 把 dump 复制一份到自检输出目录，方便直接看
+    QFile::remove(outDir + QStringLiteral("/uitest_crash_dump.txt"));
+    QFile::copy(path, outDir + QStringLiteral("/uitest_crash_dump.txt"));
+
+    struct Check
+    {
+        const char *what;
+        bool ok;
+    };
+    const QVector<Check> checks = {
+        {"里面有异常码", text.contains(QStringLiteral("异常码"))},
+        {"异常码是自检造的那个 0xE0000001",
+         text.contains(QStringLiteral("E0000001"), Qt::CaseInsensitive)},
+        {"里面有面包屑", text.contains(QStringLiteral("面包屑"))},
+        {"面包屑写着是崩溃自检", text.contains(QStringLiteral("崩溃自检"))},
+        {"里面有最近的日志", text.contains(QStringLiteral("最近的日志"))},
+        {"日志里能看到崩溃前那一条",
+         text.contains(QStringLiteral("下面这行之后进程会故意崩溃"))},
+        {"里面有寄存器",
+         text.contains(QStringLiteral("RIP=")) || text.contains(QStringLiteral("EIP="))},
+        {"里面写出错模块", text.contains(QStringLiteral("出错模块"))},
+    };
+    int failed = 0;
+    for (const Check &c : checks) {
+        QTextStream(stdout) << "crashtest: " << (c.ok ? "ok   " : "FAIL ") << c.what << "\n";
+        if (!c.ok)
+            ++failed;
+    }
+    if (failed > 0) {
+        QTextStream(stderr) << "crashtest 失败：" << failed << " 项没通过，dump 内容：\n"
+                            << text.left(2000) << "\n";
+        return 94;
+    }
+    QTextStream(stdout) << "crashtest: 崩溃报告自检通过（子进程崩了、报告写全了）\n";
+    return 0;
+#else
+    Q_UNUSED(outDir);
+    return 0;
+#endif
+}
+
+/*!
  * 界面冒烟测试：真正建出主窗口、跑几个回合的事件循环、截图后退出。
  * 用来验证排版控件、效果层、工具栏这些没法用纯逻辑测的部分。
  * 用法： tripa.exe --uitest [输出目录] [light|dark]
@@ -1828,6 +2753,9 @@ static int runUiTest(const QStringList &args)
     bool probeZoom = false;
     bool probeHwNoise = false;
     bool probePageFix = false;
+    bool probeProgress = false;
+    bool probeSoak = false;
+    bool probeCrash = false;
     QString baselineDir;
     for (int i = 2; i < args.size(); ++i) {
         const QString a = args.at(i).toLower();
@@ -1843,6 +2771,12 @@ static int runUiTest(const QStringList &args)
             probeHwNoise = true;
         else if (a == QStringLiteral("pagefix"))
             probePageFix = true;
+        else if (a == QStringLiteral("progress"))
+            probeProgress = true;
+        else if (a == QStringLiteral("soak"))
+            probeSoak = true;
+        else if (a == QStringLiteral("crashtest"))
+            probeCrash = true;
         else if (a == QStringLiteral("baseline"))
             probeBaseline = true;
         else if (a == QStringLiteral("baseline-dir") && i + 1 < args.size())
@@ -1908,6 +2842,16 @@ static int runUiTest(const QStringList &args)
             QTextStream(stderr) << "ui-test 失败：手写层默认应当遮住正文（机打字不该透出来）\n";
             return 34;
         }
+    }
+
+    /*!
+     * 崩溃报告自检放在最前面：它会拉起一个子进程故意崩掉，
+     * 和主进程里的状态互不干扰，也不受后面那些体检的影响。
+     */
+    if (probeCrash) {
+        const int rc = runCrashDumpProbe(outDir);
+        if (rc != 0)
+            return rc;
     }
 
     /*!
@@ -3018,6 +3962,14 @@ static int runUiTest(const QStringList &args)
                 plain.save(outDir + QStringLiteral("/uitest_distort_off.png"));
 
                 editor->setEffectsVisible(true);
+                /*!
+                 * 等几何算好再截图。
+                 *
+                 * 效果层的几何是**后台分片算**的（见 effectplanner.h）：前几帧
+                 * 原字照旧画着（那时还没有"洞"），算好了才换成扭曲字形。
+                 * 不耐心等的话，量到的就是"原字还在"—— 而那不是缺陷，是进度。
+                 */
+                windowSettleEffects(window);
                 for (int i = 0; i < 15; ++i)
                     QApplication::processEvents();
                 const QImage fxShot = window.grab().toImage();
@@ -3032,7 +3984,6 @@ static int runUiTest(const QStringList &args)
                  * 只量正文行就没这些事：那里除了纸就是字。
                  */
                 const QPoint vpInWindow = editor->viewport()->mapTo(&window, QPoint(0, 0));
-                const QPointF docOrigin = editor->documentOriginInViewport();
                 const double dprS = window.devicePixelRatioF();
                 /*!
                  * 只量**正文第一行那一横条**，不量整屏。
@@ -3042,9 +3993,19 @@ static int runUiTest(const QStringList &args)
                  * 而"新墨"那条判据一度恒为 0，因为拿来比的图根本不是"关效果"那张。
                  * 只量正文行就没这些事：那里除了纸就是字。
                  */
-                const QRect textBandWin(
-                    QPoint(int(vpInWindow.x() + docOrigin.x()), int(vpInWindow.y() + docOrigin.y())),
-                    QSize(240, 40));
+                const QTextBlock bandBlock = editor->document()->firstBlock();
+                const QRectF bandBlockRect =
+                    editor->document()->documentLayout()->blockBoundingRect(bandBlock);
+                /*!
+                 * 取样条的位置走 documentToViewport()（文档坐标 -> viewport），
+                 * 不要“文档原点 + 页边距”手算：文档原点现在就是**纸的左上角**，
+                 * 手算会把量到的范围落到纸边的空白上，结果就是“一个字都没量到”。
+                 */
+                const QPointF bandView = editor->documentToViewport().map(
+                    QPointF(bandBlockRect.left(), bandBlockRect.top()));
+                const QRect textBandWin(QPoint(int(vpInWindow.x() + bandView.x()),
+                                               int(vpInWindow.y() + bandView.y())),
+                                        QSize(240, 40));
                 const QRect textBand(int(textBandWin.left() * dprS),
                                      int(textBandWin.top() * dprS),
                                      int(textBandWin.width() * dprS),
@@ -3136,6 +4097,8 @@ static int runUiTest(const QStringList &args)
 
                     const QImage off = window.grab().toImage();
                     editor->setEffectsVisible(true);
+                    // 同样要等几何算好：没算好的格子还画着原字（见 windowSettleEffects）
+                    windowSettleEffects(window);
                     for (int i = 0; i < 15; ++i)
                         QApplication::processEvents();
                     const QImage on = window.grab().toImage();
@@ -3145,8 +4108,10 @@ static int runUiTest(const QStringList &args)
                     const auto blockBand = [&](int row) {
                         const QRectF br = editor->document()->documentLayout()->blockBoundingRect(
                             editor->document()->findBlockByNumber(row));
-                        return QRect(int((vpInWindow.x() + docOrigin.x() + br.left()) * dprS),
-                                     int((vpInWindow.y() + docOrigin.y() + br.top()) * dprS),
+                        const QPointF topLeft = editor->documentToViewport().map(
+                            QPointF(br.left(), br.top())); // 文档坐标 -> viewport 局部
+                        return QRect(int((vpInWindow.x() + topLeft.x()) * dprS),
+                                     int((vpInWindow.y() + topLeft.y()) * dprS),
                                      int(br.width() * dprS), int(br.height() * dprS));
                     };
                     const auto countIn = [](const QImage &img, const QRect &band, bool wantBlue) {
@@ -3632,8 +4597,27 @@ static int runUiTest(const QStringList &args)
             return rc;
     }
 
+    /*!
+     * 长活儿自检放最后：它会写一篇长稿子、套一遍效果再取消，
+     * 现场和前面那些体检完全不兼容。
+     */
+    if (probeProgress) {
+        const int rc = runProgressProbe(window, outDir);
+        if (rc != 0)
+            return rc;
+    }
+
     if (probeZoom) {
         const int rc = runZoomProbe(window, outDir);
+        if (rc != 0)
+            return rc;
+    }
+
+    /*!
+     * 折腾自检放最后：它会一直改文档/窗口/缩放，把前面那些体检的现场都搅乱。
+     */
+    if (probeSoak) {
+        const int rc = runSoakProbe(window, outDir, 400);
         if (rc != 0)
             return rc;
     }
@@ -3705,15 +4689,100 @@ void installFontNoiseFilter()
     });
 }
 
+/*!
+ * 版本号：只在这一个地方写死（CMake 的 `project(tripa VERSION 0.2)` 是另一份，
+ * 版本号写两遍迟早会不一致；这里这份是**日志和诊断信息**用的，改版本时一起改）。
+ */
+static constexpr const char *TRIPA_VERSION_STRING = "0.2";
+
+/*!
+ * \brief 把日志相关的参数从命令行里摘掉。
+ *
+ * 自检是按**位置**认参数的（`--uitest <目录> <主题> <组>`），
+ * 多一个认不出来的参数就会让整组自检跑不起来 —— 而排查问题时
+ * 十有八九是要"带日志再跑一次自检"，所以这两件事必须能共存。
+ */
+static QStringList stripLogArguments(const QStringList &arguments)
+{
+    QStringList out;
+    for (int i = 0; i < arguments.size(); ++i) {
+        const QString &a = arguments.at(i);
+        if (a == QLatin1String("--log-file")) {
+            ++i; // 连值一起摘掉
+            continue;
+        }
+        if (a == QLatin1String("--log") || a == QLatin1String("--no-log")
+            || a == QLatin1String("--log-stderr") || a == QLatin1String("--no-crash-dump")
+            || a.startsWith(QLatin1String("--log="))
+            || a.startsWith(QLatin1String("--log-file="))) {
+            continue;
+        }
+        out.append(a);
+    }
+    return out;
+}
+
 int main(int argc, char *argv[])
 {
+    /*!
+     * 日志必须在**最前面**起来：它要在 QApplication 构造之前就装好消息处理器，
+     * 这样连"Qt 起不来 / 插件加载失败"这种事都能留下记录。
+     * `parseCommandLine` 特意不依赖 Qt（只用 qgetenv / fromLocal8Bit）。
+     */
+    tripalog::Options logOptions;
+    tripalog::parseCommandLine(argc, argv, &logOptions);
+    /*!
+     * `--crashdir <目录>`：把日志/崩溃报告都放到指定目录（自检用）。
+     * 现场不需要这个参数，默认位置（`%LOCALAPPDATA%/tripa`）就好。
+     */
+    for (int i = 1; i < argc; ++i) {
+        const QString arg = QString::fromLocal8Bit(argv[i]);
+        if (arg == QLatin1String("--crashdir") && i + 1 < argc) {
+            const QString dir = QString::fromLocal8Bit(argv[i + 1]);
+            logOptions.filePath = dir + QStringLiteral("/tripa.log");
+            break;
+        }
+    }
+    tripalog::start(logOptions);
+    tripalog::breadcrumb(QStringLiteral("程序启动"));
+    {
+        // 把"启动现场"记下来：排查时第一件要问的就是这些
+        QStringList args;
+        for (int i = 1; i < argc; ++i)
+            args << QString::fromLocal8Bit(argv[i]);
+        TRIPA_INFO("app",
+                   QStringLiteral("启动：版本=%1 Qt=%2 系统=%3 参数=[%4] 工作目录=%5")
+                       .arg(QLatin1String(TRIPA_VERSION_STRING))
+                       .arg(QLatin1String(qVersion()))
+                       .arg(QSysInfo::prettyProductName(), args.join(QLatin1Char(' ')),
+                            QDir::currentPath()));
+        TRIPA_INFO("app",
+                   QStringLiteral("日志文件=%1（级别 %2）")
+                       .arg(tripalog::logFilePath().isEmpty() ? QStringLiteral("（关闭）")
+                                                              : tripalog::logFilePath())
+                       .arg(int(logOptions.level)));
+    }
+
     installFontNoiseFilter();
 
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("tripa"));
+    QApplication::setApplicationVersion(QLatin1String(TRIPA_VERSION_STRING));
     QApplication::setApplicationDisplayName(QStringLiteral("tripa 排版器"));
     QApplication::setOrganizationName(QStringLiteral("mywrite"));
     QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/tripa.png")));
+    TRIPA_INFO("app", QStringLiteral("QApplication 建好了，平台插件=%1 屏幕=%2")
+                                          .arg(QApplication::platformName())
+                                          .arg(QStringLiteral("%1x%2 @%3dpi")
+                                                   .arg(app.primaryScreen()
+                                                            ? app.primaryScreen()->geometry().width()
+                                                            : 0)
+                                                   .arg(app.primaryScreen()
+                                                            ? app.primaryScreen()->geometry().height()
+                                                            : 0)
+                                                   .arg(app.primaryScreen()
+                                                            ? qRound(app.primaryScreen()->logicalDotsPerInch())
+                                                            : 0)));
 
     QTranslator translator;
     const QStringList uiLanguages = QLocale::system().uiLanguages();
@@ -3725,12 +4794,35 @@ int main(int argc, char *argv[])
         }
     }
 
-    const QStringList args = QApplication::arguments();
-    if (args.size() > 1 && args.at(1) == QStringLiteral("--selftest"))
-        return runSelfTest(args.mid(1));
-    if (args.size() > 1 && args.at(1) == QStringLiteral("--uitest"))
-        return runUiTest(args.mid(1));
+    /*!
+     * 自检那条路要把 `--log` 之类的参数摘掉再往下传：
+     * `--uitest <目录> <主题> <组>` 是按位置认参数的，
+     * 多一个认不出来的参数就会让整组自检跑不起来。
+     * （QApplication 已经吃过 argv 了，它只挑自己认识的，不受影响。）
+     */
+    QStringList args = QApplication::arguments();
+    args = stripLogArguments(args);
+    if (args.size() > 1 && args.at(1) == QStringLiteral("--selftest")) {
+        const int rc = runSelfTest(args.mid(1));
+        TRIPA_INFO("app", QStringLiteral("--selftest 结束，返回码=%1").arg(rc));
+        tripalog::shutdown();
+        return rc;
+    }
+    if (args.size() > 1 && args.at(1) == QStringLiteral("--crashtest")) {
+        // 故意崩：崩溃处理器会写出 dump（见 runCrashDumpProbe）
+        return runCrashChild();
+    }
+    if (args.size() > 1 && args.at(1) == QStringLiteral("--uitest")) {
+        const int rc = runUiTest(args.mid(1));
+        TRIPA_INFO("app", QStringLiteral("--uitest 结束，返回码=%1").arg(rc));
+        tripalog::shutdown();
+        return rc;
+    }
     MainWindow window;
     window.show();
-    return QApplication::exec();
+    TRIPA_INFO("app", QStringLiteral("主窗口已显示，进入事件循环"));
+    const int rc = QApplication::exec();
+    TRIPA_INFO("app", QStringLiteral("事件循环退出，返回码=%1").arg(rc));
+    tripalog::shutdown();
+    return rc;
 }

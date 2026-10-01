@@ -32,6 +32,7 @@ qrc_*.cpp
 Thumbs.db
 *.res
 *.rc
+!tripa.rc
 /.qmake.cache
 /.qmake.stash
 **/.qmlls.ini
@@ -82,3 +83,9 @@ CMakeLists.txt.user*
 .uic/
 /build*/
 /.qtcreator/
+
+# 自检跑出来的中间产物（图、PDF、崩溃报告目录）——跑一次就脏一次工作区，一律不进版本库
+/selftest*.png
+/selftest*.pdf
+/uitest_out*/
+/crashtest_logs/

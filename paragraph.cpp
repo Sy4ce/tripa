@@ -83,6 +83,15 @@ ParagraphFormat ParagraphFormat::fromBlockFormat(const QTextBlockFormat &format)
 
     result.pageBreakBefore = format.pageBreakPolicy().testFlag(QTextBlockFormat::PageBreak_AlwaysBefore);
     result.keepWithNext = format.pageBreakPolicy().testFlag(QTextBlockFormat::PageBreak_AlwaysAfter);
+    /*!
+     * 这两项没有 QTextBlockFormat 字段，用自定义属性存（见 paragraph.h 里的说明）。
+     * **没存过就是关**：排版引擎那边（paginatinglayout.cpp）也按这个默认走 ——
+     * "字被挤到下边界才换页"是这套排版的基准行为，孤行控制是额外的排版习惯，
+     * 该由段落自己显式打开。
+     */
+    // QTextFormat::boolProperty() 只有“一个属性 id”的版本：属性不存在时返回 false
+    result.keepLinesTogether = format.boolProperty(tripaformat::kKeepLinesTogether);
+    result.widowControl = format.boolProperty(tripaformat::kWidowControl);
     return result;
 }
 
@@ -136,6 +145,10 @@ QTextBlockFormat ParagraphFormat::toBlockFormat(double charWidth) const
     if (keepWithNext)
         flags |= QTextBlockFormat::PageBreak_AlwaysAfter;
     format.setPageBreakPolicy(flags);
+
+    //! 段中不分页 / 孤行控制：QTextBlockFormat 没有字段，用自定义属性存
+    format.setProperty(tripaformat::kKeepLinesTogether, keepLinesTogether);
+    format.setProperty(tripaformat::kWidowControl, widowControl);
 
     return format;
 }

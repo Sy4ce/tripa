@@ -9,15 +9,18 @@
 #include "proofsheet.h"
 #include "texteditor.h"
 #include "tripadocument.h"
+#include "tripalog.h"
 
 #include <QAbstractTextDocumentLayout>
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -41,11 +44,13 @@
 #include <QPixmap>
 #include <QPrintDialog>
 #include <QPrinter>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSettings>
+#include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStatusBar>
@@ -54,6 +59,7 @@
 #include <QTextCharFormat>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <QTimer>
 #include <QTextStream>
 #include <QToolBar>
 #include <QToolButton>
@@ -64,6 +70,181 @@
 #include <functional>
 
 namespace {
+
+/*!
+ * \brief 给一批区间逐字套 / 清效果样式（**分片做，可取消**）。
+ *
+ * 这是以前 `MainWindow::applyEffectToRanges()` / `clearHandwriting()` /
+ * `clearDistortion()` 里那个"一口气跑完"的循环。实测：2050 个字要 78ms，
+ * 两万字的稿子就是 800ms —— 期间窗口完全没响应，连取消都点不到。
+ *
+ * 拆成两件事之后：任务只负责"改到哪儿了、改了多少"，
+ * "多久改一次、进度怎么显示、能不能取消"全是 JobRunner 的事。
+ */
+class EffectStyleJob : public Job
+{
+public:
+    enum class Mode
+    {
+        Apply, //!< 套上 kind 对应的效果
+        Clear, //!< 清掉效果（clearAllKinds 为假时只清 kind 那一种）
+    };
+
+    EffectStyleJob(QTextDocument *document, QVector<QPair<int, int>> ranges, Mode mode,
+                   EffectKind kind, bool clearAllKinds, bool perChar, quint32 seed,
+                   QString title)
+        : m_document(document)
+        , m_ranges(std::move(ranges))
+        , m_mode(mode)
+        , m_kind(kind)
+        , m_clearAllKinds(clearAllKinds)
+        , m_perChar(perChar)
+        , m_seed(seed)
+        , m_title(std::move(title))
+    {
+        for (const QPair<int, int> &range : m_ranges)
+            m_total += qMax(0, range.second - range.first);
+    }
+
+    QString title() const override { return m_title; }
+    int total() const override { return m_total; }
+    int done() const override { return m_visited; }
+    QString detail() const override
+    {
+        return QObject::tr("已处理 %1/%2 个字符").arg(m_visited).arg(m_total);
+    }
+
+    //! 真的改动了多少个字符
+    int applied() const { return m_applied; }
+    //! 其中有多少个是"保留手写、噪声加到笔迹上"（状态栏要说实话）
+    int noiseOnHandwriting() const { return m_noiseOnHandwriting; }
+
+    /*!
+     * 收尾钩子：参数是（是不是被取消的，改了多少个字符，其中多少个是手写笔迹）。
+     *
+     * 任务自己不动界面 —— 它只把结果告诉调用方，
+     * "恢复可编辑、写状态栏、切显示层"这些是主窗口的事。
+     */
+    void setFinishHook(std::function<void(bool cancelled, int applied, int noiseOnHandwriting)> hook)
+    {
+        m_finishHook = std::move(hook);
+    }
+
+    /*!
+     * 收尾：被取消时**把改过的字符一个个写回去**（取消 = 什么都没发生）。
+     *
+     * 不用 `QTextDocument::undo()`：那撤的是"最后一步"，
+     * 而我们这个编辑块可能已经和前面用户自己的操作并成了一步 ——
+     * 撤销会把用户之前改的东西一起撤掉。自己记、自己写回，最坏也就是
+     * 白跑一遍已处理的那部分（几百个字，几毫秒）。
+     */
+    void finish(bool cancelled) override
+    {
+        if (cancelled && !m_undo.isEmpty() && m_document) {
+            for (const QPair<int, EffectStyle> &entry : m_undo) {
+                QTextCursor one(m_document);
+                one.setPosition(entry.first);
+                one.setPosition(entry.first + 1, QTextCursor::KeepAnchor);
+                QTextCharFormat fmt = one.charFormat();
+                setEffectStyle(&fmt, entry.second);
+                one.setCharFormat(fmt);
+            }
+        }
+        if (m_finishHook)
+            m_finishHook(cancelled, m_applied, m_noiseOnHandwriting);
+    }
+
+    bool step() override
+    {
+        if (!m_document)
+            return false;
+
+        // 一片大约 200 个字：单字代价 ~40µs，一片不到 10ms（调度器的预算也是 12ms）
+        int budget = 200;
+        while (budget-- > 0) {
+            if (!advance())
+                return false;
+        }
+        return true;
+    }
+
+private:
+    //! 往前走一个字；返回 false = 全部区间都走完了
+    bool advance()
+    {
+        for (;;) {
+            if (m_rangeIndex >= m_ranges.size())
+                return false;
+            const QPair<int, int> range = m_ranges.at(m_rangeIndex);
+            if (m_position < range.first)
+                m_position = range.first;
+            if (m_position >= range.second) {
+                ++m_rangeIndex;
+                continue;
+            }
+
+            const int pos = m_position++;
+            ++m_visited;
+
+            QTextCursor one(m_document);
+            one.setPosition(pos);
+            one.setPosition(pos + 1, QTextCursor::KeepAnchor);
+            const QTextCharFormat before = one.charFormat();
+            const EffectStyle old = effectStyle(before);
+
+            if (m_mode == Mode::Apply) {
+                /*!
+                 * 套扭曲时，已经有手写的字符**保留手写**（见 effect.h 的
+                 * distortionEffectKind）：噪声加到手写笔迹上，而不是把手写换成
+                 * "原字体 + 噪声"。种子照样换一个新的 —— 手写层的噪声波是按字符
+                 * 种子现生成的，换了种子就换了一种抖法。
+                 */
+                EffectStyle style;
+                style.kind = (m_kind == EffectKind::Distortion) ? distortionEffectKind(before)
+                                                                : m_kind;
+                style.seed = m_perChar ? (m_seed + quint32(pos) * 2654435761u) : m_seed;
+                QTextCharFormat fmt;
+                setEffectStyle(&fmt, style);
+                one.mergeCharFormat(fmt);
+                ++m_applied;
+                if (m_kind == EffectKind::Distortion && style.kind == EffectKind::Handwriting)
+                    ++m_noiseOnHandwriting;
+            } else {
+                if (!old.isValid())
+                    continue;
+                if (!m_clearAllKinds && old.kind != m_kind)
+                    continue;
+                // 把原格式整体写回去、只是不带效果属性：
+                // mergeCharFormat 不会因为"补丁里没有这个属性"就删掉它。
+                QTextCharFormat fmt = before;
+                setEffectStyle(&fmt, EffectStyle());
+                one.setCharFormat(fmt);
+                ++m_applied;
+            }
+            // 记下"原来是什么效果"：取消时原样写回去
+            m_undo.append(qMakePair(pos, old));
+            return true;
+        }
+    }
+
+    QTextDocument *m_document = nullptr;
+    QVector<QPair<int, int>> m_ranges;
+    Mode m_mode = Mode::Apply;
+    EffectKind m_kind = EffectKind::Distortion;
+    bool m_clearAllKinds = false;
+    bool m_perChar = true;
+    quint32 m_seed = 0;
+    QString m_title;
+    int m_total = 0;
+    int m_visited = 0;
+    int m_applied = 0;
+    int m_noiseOnHandwriting = 0;
+    int m_rangeIndex = 0;
+    int m_position = 0;
+    //! 改过的字符原来是什么效果（取消时写回去）
+    QVector<QPair<int, EffectStyle>> m_undo;
+    std::function<void(bool cancelled, int applied, int noiseOnHandwriting)> m_finishHook;
+};
 
 /*!
  * 工具栏图标的墨色。
@@ -309,8 +490,29 @@ MainWindow::MainWindow(QWidget *parent)
     buildMenus();
     buildToolBars();
     buildSelectionDock();
+
+    /*!
+     * 长活儿的调度器（见 jobrunner.h）。它属于主窗口而不是某个控件：
+     * 一次只能跑一个任务，而"一次"是整个程序范围内的概念。
+     *
+     * 必须建在 `buildJobUi()` 之前 —— 状态栏那套控件（进度条、取消按钮）
+     * 一装好就会引用它。
+     */
+    m_jobs = new JobRunner(this);
+    connect(m_jobs, &JobRunner::started, this, &MainWindow::onJobStarted);
+    connect(m_jobs, &JobRunner::progressed, this, &MainWindow::onJobProgressed);
+    connect(m_jobs, &JobRunner::finished, this, &MainWindow::onJobFinished);
+
     buildStatusBar();
 
+    /*!
+     * 视图发现"有字形几何要算"时不自己算（那是 `paintEvent` 里最忌讳的事），
+     * 而是把这件事交给调度器：分片算、算一片重画一次、进度显示在状态栏上。
+     */
+    connect(m_editor, &TextEditor::effectWorkNeeded, this, [this] {
+        if (m_editor->effectPlanner())
+            m_jobs->enqueue(new EffectWorkJob(m_editor->effectPlanner()));
+    });
     m_pageSetup = PageSetup();
     m_editor->setPageSetup(m_pageSetup);
 
@@ -341,8 +543,21 @@ MainWindow::MainWindow(QWidget *parent)
     m_editor->setFocus();
 }
 
-MainWindow::~MainWindow() = default;
-
+/*!
+ * 窗口析构时先把调度器**就地拆掉**。
+ *
+ * 任务收尾（`Job::finish()`）时会回头摸界面：取消只读、写状态栏、切显示层。
+ * 如果拖到 QObject 子对象析构那一轮，窗口自己的成员早就没了，那是拿已销毁的对象。
+ * 显式删掉调度器，所有任务的收尾就都发生在窗口还活着的时候。
+ */
+MainWindow::~MainWindow()
+{
+    if (m_jobs) {
+        m_jobs->cancelAll();
+        delete m_jobs;
+        m_jobs = nullptr;
+    }
+}
 /*!
  * 主题变了就重画图标。
  *
@@ -653,6 +868,46 @@ void MainWindow::buildMenus()
     fxMenu->addAction(act("act_showdistort"));
 
     QMenu *helpMenu = menuBar()->addMenu(tr("帮助(&?)"));
+    /*!
+     * 「诊断信息」有两个动作：
+     *   - 复制：把日志尾部 + 环境 + 面包屑拼成一段文本放进剪贴板，
+     *     用户直接粘回来就行（现场没法调试，只能靠这个）；
+     *   - 打开日志：用系统默认程序打开日志文件（找不到就说明日志没起来，
+     *     那就告诉用户日志在哪、怎么开）。
+     */
+    QAction *copyDiagAct = helpMenu->addAction(tr("复制诊断信息"));
+    copyDiagAct->setObjectName(QStringLiteral("act_copydiag"));
+    copyDiagAct->setToolTip(tr("把最近的日志和环境信息复制到剪贴板（报问题时贴这段）"));
+    connect(copyDiagAct, &QAction::triggered, this, [this] {
+        const QString report = tripalog::helpReport(100);
+        QGuiApplication::clipboard()->setText(report);
+        QMessageBox::information(
+            this, tr("诊断信息"),
+            tr("已经把最近 100 条日志和环境信息复制到剪贴板。\n\n"
+               "把它贴到反馈里即可。日志文件：\n%1\n\n崩溃报告目录：\n%2")
+                .arg(tripalog::logFilePath().isEmpty() ? tr("（未启用）")
+                                                       : tripalog::logFilePath(),
+                     tripalog::dumpDirectory().isEmpty() ? tr("（未启用）")
+                                                         : tripalog::dumpDirectory()));
+    });
+
+    QAction *openLogAct = helpMenu->addAction(tr("打开日志文件"));
+    openLogAct->setObjectName(QStringLiteral("act_openlog"));
+    connect(openLogAct, &QAction::triggered, this, [this] {
+        const QString path = tripalog::logFilePath();
+        if (path.isEmpty()) {
+            QMessageBox::warning(this, tr("日志"),
+                                 tr("日志没有启用（用 --log 启动，或者看是不是没权限写 "
+                                    "%1）。\n崩溃报告目录：%2")
+                                     .arg(tripalog::dumpDirectory(),
+                                          tripalog::dumpDirectory()));
+            return;
+        }
+        if (!QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
+            QMessageBox::information(this, tr("日志"), tr("日志文件在：\n%1").arg(path));
+    });
+    helpMenu->addSeparator();
+
     QAction *aboutAct = helpMenu->addAction(tr("关于 tripa"));
     connect(aboutAct, &QAction::triggered, this, [this] {
         QMessageBox::about(this, tr("关于 tripa"),
@@ -1103,6 +1358,149 @@ void MainWindow::buildStatusBar()
     connect(m_editor, &TextEditor::zoomChanged, this, &MainWindow::onZoomChanged);
 
     onZoomChanged(m_editor->zoom());
+
+    buildJobUi();
+}
+
+/*!
+ * 状态栏上的任务进度：**任务名 + 进度条 + 取消**。
+ *
+ * 位置放在 `m_statusInfo` 左边（都是 permanent widget）：
+ * 左边的普通区域留给 `showMessage()` 的临时提示 ——
+ * 两者能同时看见，不会"一提示就把进度盖掉"。
+ */
+void MainWindow::buildJobUi()
+{
+    m_jobLabel = new QLabel(this);
+    m_jobLabel->setObjectName(QStringLiteral("jobLabel"));
+
+    m_jobBar = new QProgressBar(this);
+    m_jobBar->setObjectName(QStringLiteral("jobBar"));
+    m_jobBar->setRange(0, 100);
+    m_jobBar->setValue(0);
+    m_jobBar->setTextVisible(false);
+    m_jobBar->setFixedWidth(120);
+    m_jobBar->setFixedHeight(12);
+
+    m_jobCancel = new QToolButton(this);
+    m_jobCancel->setObjectName(QStringLiteral("jobCancel"));
+    m_jobCancel->setText(QStringLiteral("✕"));
+    m_jobCancel->setAutoRaise(true);
+    m_jobCancel->setToolTip(tr("取消当前任务（也可以按 Esc）"));
+    connect(m_jobCancel, &QToolButton::clicked, this, [this] { m_jobs->cancelCurrent(); });
+
+    statusBar()->addPermanentWidget(m_jobLabel);
+    statusBar()->addPermanentWidget(m_jobBar);
+    statusBar()->addPermanentWidget(m_jobCancel);
+
+    /*!
+     * 进度条要**晚一点出现、晚一点消失**：
+     * 打字顺手碰到一个 30ms 的小任务时，进度条一闪而过比不显示还刺眼；
+     * 反过来，任务做完了立刻消失，用户又看不到"刚才到底在干什么"。
+     */
+    m_jobShowTimer = new QTimer(this);
+    m_jobShowTimer->setSingleShot(true);
+    m_jobShowTimer->setInterval(250);
+    connect(m_jobShowTimer, &QTimer::timeout, this, [this] {
+        if (!m_jobs->busy())
+            return;
+        m_jobBar->setVisible(true);
+        m_jobCancel->setVisible(true);
+    });
+
+    m_jobHideTimer = new QTimer(this);
+    m_jobHideTimer->setSingleShot(true);
+    m_jobHideTimer->setInterval(600);
+    connect(m_jobHideTimer, &QTimer::timeout, this, [this] {
+        if (m_jobs->busy())
+            return;
+        m_jobLabel->setVisible(false);
+        m_jobBar->setVisible(false);
+        m_jobCancel->setVisible(false);
+    });
+
+    m_jobLabel->setVisible(false);
+    m_jobBar->setVisible(false);
+    m_jobCancel->setVisible(false);
+
+    // 取消：状态栏上那个叉，以及 Esc（只在真的有任务时才起作用）
+    auto *escape = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+    escape->setContext(Qt::WindowShortcut);
+    connect(escape, &QShortcut::activated, this, [this] {
+        if (m_jobs->busy() && m_jobs->progress().cancellable)
+            m_jobs->cancelCurrent();
+    });
+}
+
+/*!
+ * 把一份进度快照贴到状态栏上。
+ *
+ * 总数未知（`total <= 0`）时进度条转成"忙"状态（Qt 的 0/0 范围会自动来回跑）——
+ * 这比假装一个百分比诚实。
+ */
+void MainWindow::applyJobProgress(const JobProgress &progress)
+{
+    if (!m_jobLabel || !m_jobBar)
+        return;
+
+    const bool known = progress.total > 0;
+    if (known) {
+        m_jobBar->setRange(0, progress.total);
+        m_jobBar->setValue(qBound(0, progress.done, progress.total));
+    } else {
+        m_jobBar->setRange(0, 0);
+    }
+
+    QString text = progress.title;
+    if (known)
+        text += QStringLiteral(" %1%").arg(int(std::lround(progress.fraction() * 100.0)));
+    if (!progress.detail.isEmpty())
+        text += QStringLiteral("（%1）").arg(progress.detail);
+    m_jobLabel->setText(text);
+    m_jobLabel->setToolTip(text);
+    /*!
+     * 任务名和百分比**立刻**显示：那只是状态栏上的一行字，不刺眼。
+     * 延迟出现的是**进度条和取消按钮**（见下面那个定时器）—— 它们会明显
+     * 改变状态栏的布局，一闪而过比不出现更难受。
+     */
+    if (progress.running)
+        m_jobLabel->setVisible(true);
+    if (m_jobCancel)
+        m_jobCancel->setEnabled(progress.cancellable);
+}
+
+void MainWindow::onJobStarted(const JobProgress &progress)
+{
+    m_jobShowTimer->stop();
+    m_jobHideTimer->stop();
+    applyJobProgress(progress);
+    // 任务干得够快的话，这条定时器会被 stop 掉，进度条一次都不出现
+    m_jobShowTimer->start();
+}
+
+void MainWindow::onJobProgressed(const JobProgress &progress)
+{
+    applyJobProgress(progress);
+    /*!
+     * 进度条已经出来了就不用再定时了。
+     *
+     * 注意判据是**进度条**可见，不是任务名可见：任务名从任务一开始就显示
+     * （那只是一行字），拿它当判据的话，第一条进度信号就会把这个定时器掐死，
+     * 进度条永远不会出现 —— 实测就是这么错的（跑一秒多的任务也看不到条）。
+     */
+    if (m_jobBar && m_jobBar->isVisible())
+        m_jobShowTimer->stop();
+}
+
+void MainWindow::onJobFinished(const JobProgress &progress, bool cancelled)
+{
+    m_jobShowTimer->stop();
+    applyJobProgress(progress);
+    if (cancelled)
+        statusBar()->showMessage(tr("已取消：%1").arg(progress.title), 5000);
+    // 进度条多留一会儿（不然"刚才在干什么"一闪就没了）
+    m_jobHideTimer->start();
+    updateStatus();
 }
 
 void MainWindow::onZoomChanged(double zoom)
@@ -1689,15 +2087,10 @@ void MainWindow::onFontSizeChosen(double pointSize)
 
 void MainWindow::applyRandomFonts()
 {
-    const QVector<QPair<int, int>> ranges = effectRanges();
-    const QTextCursor selection = m_editor->textCursor();
-    if (!selection.hasSelection() && m_regexRanges.isEmpty()) {
-        QMessageBox::information(this, tr("随机字体"),
-                                 tr("请先选中一段文字。\n\n"
-                                    "提示：可以用「选中 → 一键选中所有中文 / 英文」，"
-                                    "或者用正则表达式快速选出目标文字。"));
-        return;
-    }
+    // 没选区 = 全文（和【笔画扭曲】一致，见 effectRanges 的说明）
+    bool wholeDocument = false;
+    const QVector<QPair<int, int>> ranges = effectRanges(&wholeDocument);
+    Q_UNUSED(wholeDocument);
     if (m_fontPool.isEmpty()) {
         QMessageBox::information(this, tr("随机字体池是空的"),
                                  tr("还没有可用的随机字体。\n\n"
@@ -1709,57 +2102,72 @@ void MainWindow::applyRandomFonts()
     const bool varySize = m_randomMinSpin && m_randomMaxSpin
                           && m_randomMaxSpin->value() > m_randomMinSpin->value() + 0.001;
 
-    QTextCursor work(m_editor->document());
-    work.beginEditBlock();
-
-    QStringList usedFamilies;
-    int count = 0;
+    /*!
+     * 逐字换字体这件活很碎（两千个字就是两千次光标操作），
+     * 交给调度器分片做 —— 界面不会白一下，状态栏上有进度，Esc 能取消。
+     */
+    const QStringList pool = m_fontPool;
+    const double sizeLo = varySize ? m_randomMinSpin->value() : 0.0;
+    const double sizeHi = varySize ? m_randomMaxSpin->value() : 0.0;
+    QVector<int> positions;
     for (const auto &range : ranges) {
-        for (int pos = range.first; pos < range.second; ++pos) {
-            QTextCursor one(m_editor->document());
-            one.setPosition(pos);
-            one.setPosition(pos + 1, QTextCursor::KeepAnchor);
-            const QString s = one.selectedText();
-            if (s.isEmpty() || s.at(0).isSpace())
-                continue;
-
-            // 只在"用户勾选的字体池"里随机
-            const QString family = m_fontPool.at(QRandomGenerator::global()->bounded(int(m_fontPool.size())));
-            if (!usedFamilies.contains(family))
-                usedFamilies.append(family);
-
-            QTextCharFormat fmt;
-            setFormatFontFamily(&fmt, family);
-            if (varySize) {
-                const double lo = m_randomMinSpin->value();
-                const double hi = m_randomMaxSpin->value();
-                fmt.setFontPointSize(lo + QRandomGenerator::global()->generateDouble() * (hi - lo));
-            }
-            one.mergeCharFormat(fmt);
-            ++count;
-        }
+        for (int pos = range.first; pos < range.second; ++pos)
+            positions.append(pos);
     }
-    work.endEditBlock();
 
-    m_editor->relayout();
-    statusBar()->showMessage(tr("已为 %1 个字符随机设置字体（字体池 %2 种，用到 %3 种）：%4")
-                                 .arg(count)
-                                 .arg(m_fontPool.size())
-                                 .arg(usedFamilies.size())
-                                 .arg(usedFamilies.mid(0, 8).join(QStringLiteral("、"))),
-                             12000);
-    updateStatus();
+    beginJobEdit();
+    auto *job = new LoopJob(tr("随机字体"), positions.size(), [this, positions, pool, sizeLo, sizeHi,
+                                                              varySize](int index) {
+        const int pos = positions.at(index);
+        QTextCursor one(m_editor->document());
+        one.setPosition(pos);
+        one.setPosition(pos + 1, QTextCursor::KeepAnchor);
+        const QString s = one.selectedText();
+        if (s.isEmpty() || s.at(0).isSpace())
+            return;
+
+        // 只在"用户勾选的字体池"里随机
+        const QString family = pool.at(QRandomGenerator::global()->bounded(int(pool.size())));
+        QTextCharFormat fmt;
+        setFormatFontFamily(&fmt, family);
+        if (varySize)
+            fmt.setFontPointSize(sizeLo
+                                 + QRandomGenerator::global()->generateDouble() * (sizeHi - sizeLo));
+        one.mergeCharFormat(fmt);
+    });
+    job->setDetailProvider([](int index) { return tr("第 %1 个字符").arg(index); });
+    job->setFinishHook([this, pool](bool cancelled, int processed) {
+        endJobEdit();
+        m_editor->relayout();
+        if (cancelled) {
+            statusBar()->showMessage(tr("已取消随机字体（处理到第 %1 个字符）").arg(processed), 6000);
+        } else {
+            statusBar()->showMessage(tr("已为 %1 个字符随机设置字体（字体池 %2 种）")
+                                         .arg(processed)
+                                         .arg(pool.size()),
+                                     12000);
+        }
+        updateStatus();
+    });
+    m_jobs->enqueue(job);
 }
 
+/*!
+ * 取消随机字体（回到页面全局字体）。
+ *
+ * 和"随机字体"一样是逐字的碎活，同样分片做。
+ */
 void MainWindow::clearRandomFonts()
 {
     QTextCursor cursor = m_editor->textCursor();
     if (!cursor.hasSelection())
         cursor.select(QTextCursor::Document);
 
-    QTextCursor work(cursor);
-    work.beginEditBlock();
-    for (int pos = work.selectionStart(); pos < work.selectionEnd(); ++pos) {
+    const int first = cursor.selectionStart();
+    const int last = cursor.selectionEnd();
+    beginJobEdit();
+    auto *job = new LoopJob(tr("取消随机字体"), qMax(0, last - first), [this, first](int index) {
+        const int pos = first + index;
         QTextCursor one(m_editor->document());
         one.setPosition(pos);
         one.setPosition(pos + 1, QTextCursor::KeepAnchor);
@@ -1773,12 +2181,136 @@ void MainWindow::clearRandomFonts()
         fmt.clearProperty(QTextFormat::FontFamily);
 #endif
         one.setCharFormat(fmt);
-    }
-    work.endEditBlock();
-    m_editor->setTextCursor(work);
-    m_editor->relayout();
-    statusBar()->showMessage(tr("已取消随机字体，回到页面的全局字体"), 6000);
+    });
+    job->setFinishHook([this](bool cancelled, int processed) {
+        endJobEdit();
+        m_editor->relayout();
+        statusBar()->showMessage(cancelled
+                                     ? tr("已取消（处理到第 %1 个字符）").arg(processed)
+                                     : tr("已取消随机字体，回到页面的全局字体"),
+                                 6000);
+        updateStatus();
+    });
+    m_jobs->enqueue(job);
 }
+
+// ---------------------------------------------------------------- 长活儿（jobrunner.h）
+
+/*!
+ * 现在能开一个"要改文档"的任务吗。
+ *
+ * 两个任务同时改同一份文档是灾难（位置、编辑块、撤销栈全会错），
+ * 所以所有会改文档的菜单动作都先过这一关。
+ */
+bool MainWindow::canStartEditJob(const QString &what)
+{
+    if (!m_jobs || m_jobs->idle())
+        return true;
+    const JobProgress progress = m_jobs->progress();
+    statusBar()->showMessage(tr("正在「%1」，完成后再「%2」（可以按 Esc 取消）")
+                                 .arg(progress.title.isEmpty() ? tr("处理中") : progress.title, what),
+                             6000);
+    return false;
+}
+
+/*!
+ * 任务改文档期间的统一包装：编辑器转只读 + 开一个编辑块。
+ *
+ * 只读是有必要的：任务会在事件循环里让出成百上千次，用户完全有机会在中间敲字。
+ * 一旦敲了，任务手里的位置就全错位了 —— 与其每片重算一遍（又慢又容易错），
+ * 不如这几十到几百毫秒里不让改。滚动、缩放、看进度、取消都照常能用。
+ *
+ * 编辑块是给撤销用的：整个操作（哪怕分了几百片）算**一步**，
+ * Ctrl+Z 一次就能全撤回去。
+ */
+void MainWindow::beginJobEdit()
+{
+    /*!
+     * 先把光标（含选区）存下来。
+     *
+     * `setReadOnly(true)` 会把选区弄丢 —— 这不是猜的，是实测：
+     * 用户选一段字、点【笔画扭曲】、完事之后再点一次，弹出来的是
+     * "请先选中一段文字"，而他眼里那段字明明还高亮着。
+     * 存下来、收尾时放回去，这个坑就没了。
+     */
+    m_jobCursor = std::make_unique<QTextCursor>(m_editor->textCursor());
+
+    /*!
+     * 这几个动作里 `setReadOnly()` 是唯一可能慢的（Qt 会顺手拆摞光标、重绘）：
+     * 超过 50ms 就记一笔 —— "点了一下卡一下"的账必须算得清。
+     */
+    QElapsedTimer clock;
+    clock.start();
+    m_editor->setReadOnly(true);
+    const qint64 readOnlyMs = clock.restart();
+    /*!
+     * 顺手把重画也压住。
+     *
+     * 这一步不是"顺手优化"，是**必需**的：任务每改一片，文档就变一次，
+     * 而视图每重画一次都会重新规划看得见的那几段、并要求重算它们的字形几何
+     * （几百个字）。于是就成了正反馈：改一点 -> 重画 -> 重算几百个字 -> 改一点。
+     * 实测：一千多字的操作本来 0.4 秒，开着重画跑了 **30 秒**（--uitest progress 量到的）。
+     * 压住之后屏幕上保持原样，进度条一直在走，干完一次性画成新的。
+     */
+    m_editor->setRepaintsDeferred(true);
+    m_jobEdit = std::make_unique<QTextCursor>(m_editor->document());
+    m_jobEdit->beginEditBlock();
+    if (const qint64 spent = readOnlyMs + clock.elapsed(); spent > 50)
+        TRIPA_WARN("jobs", QStringLiteral("任务开工前花了 %1ms（转只读 %2ms，开编辑块 %3ms）")
+                              .arg(spent)
+                              .arg(readOnlyMs)
+                              .arg(clock.elapsed()));
+}
+
+void MainWindow::endJobEdit()
+{
+    if (m_jobEdit) {
+        m_jobEdit->endEditBlock();
+        m_jobEdit.reset();
+    }
+    m_editor->setReadOnly(false);
+    /*!
+     * 把选区放回去（`setReadOnly` 之后光标已经跑到别处去了）。
+     *
+     * 必须在**恢复可编辑之后**做：只读状态下 Qt 会把光标再规整一次，
+     * 先设后放等于白设。
+     */
+    if (m_jobCursor) {
+        m_editor->setTextCursor(*m_jobCursor);
+        m_jobCursor.reset();
+    }
+    m_editor->setRepaintsDeferred(false);
+    /*!
+     * 改完之后重画一次。
+     *
+     * `setRepaintsDeferred(false)` 自己会补一次重画，但那一次可能赶在
+     * `endEditBlock()` 引发的重排之前；这里再推一次，保证屏幕上看到的是**最终**的样子。
+     */
+    m_editor->viewport()->update();
+}
+
+/*!
+ * 把"逐字套 / 清效果样式"交给调度器。
+ *
+ * 进度、分片、取消、一次撤销全在任务和调度器里；这里只负责接线：
+ * 开任务之前转只读，任务完了恢复，然后把结果告诉调用方。
+ */
+void MainWindow::startEffectStyleJob(
+    const QVector<QPair<int, int>> &ranges, const QString &title, EffectKind kind, bool clear,
+    bool clearAllKinds, bool perChar, quint32 seed,
+    const std::function<void(int applied, int noiseOnHandwriting, bool cancelled)> &done)
+{
+    beginJobEdit();
+    auto *job = new EffectStyleJob(m_editor->document(), ranges,
+                                    clear ? EffectStyleJob::Mode::Clear : EffectStyleJob::Mode::Apply,
+                                    kind, clearAllKinds, perChar, seed, title);
+    job->setFinishHook([this, done](bool cancelled, int applied, int noiseOnHandwriting) {
+        endJobEdit();
+        done(applied, noiseOnHandwriting, cancelled);
+    });
+    m_jobs->enqueue(job);
+}
+
 
 // ---------------------------------------------------------------- 手写数据
 
@@ -1890,8 +2422,23 @@ QStringList MainWindow::selectionCharacters() const
     return chars;
 }
 
-QVector<QPair<int, int>> MainWindow::effectRanges() const
+/*!
+ * 当前操作的目标区间。
+ *
+ * 三段优先级：正则命中（且主选区还停在其中）> 普通选区 > **全文**。
+ *
+ * 第三段从前是"不干"：没选区就弹一个"请先选中一段文字"的模态对话框。
+ * 用户给的答复是"没选中就直接作用于全文，别再弹窗"—— 于是改成现在这样：
+ * 没选中 = 全文，而且在状态栏里明明白白说一句"作用于全文 N 个字符"，
+ * 误操作也能一次 Ctrl+Z 撤回去。
+ *
+ * `wholeDocument` 非空时输出"这次是不是全文兜底"，供状态栏报个数。
+ */
+QVector<QPair<int, int>> MainWindow::effectRanges(bool *wholeDocument) const
 {
+    if (wholeDocument)
+        *wholeDocument = false;
+
     // 1) 正则匹配过、且主选区还停在其中时：作用于全部匹配
     if (!m_regexRanges.isEmpty()) {
         const QTextCursor cursor = m_editor->textCursor();
@@ -1908,6 +2455,8 @@ QVector<QPair<int, int>> MainWindow::effectRanges() const
         return {{cursor.selectionStart(), cursor.selectionEnd()}};
 
     // 3) 没有选区：全文
+    if (wholeDocument)
+        *wholeDocument = true;
     return {{0, m_editor->document()->characterCount() - 1}};
 }
 
@@ -1918,15 +2467,9 @@ QStringList MainWindow::collectMissingHandwriting() const
 
 void MainWindow::applyHandwriting()
 {
-    const QVector<QPair<int, int>> ranges = effectRanges();
-    const QTextCursor cursor = m_editor->textCursor();
-    if (!cursor.hasSelection() && m_regexRanges.isEmpty()) {
-        QMessageBox::information(this, tr("手写数据"),
-                                 tr("请先选中一段文字。\n\n"
-                                    "可以用「选中 → 一键选中所有中文 / 英文」"
-                                    "或正则表达式快速选出目标文字。"));
-        return;
-    }
+    // 没选区 = 全文（和【笔画扭曲】一致，见 effectRanges 的说明）
+    bool wholeDocument = false;
+    const QVector<QPair<int, int>> ranges = effectRanges(&wholeDocument);
 
     if (m_library.characterCount() == 0) {
         QMessageBox::warning(
@@ -1938,21 +2481,44 @@ void MainWindow::applyHandwriting()
         return;
     }
 
-    // 缺数据检查（只查被操作的区间）
+    /*!
+     * 缺数据检查（只查被操作的区间）。
+     *
+     * 按**片段**走，不是逐字建一个 QTextCursor：后者每个字要构一个光标、
+     * 取一次格式，量级是每个字好几微秒；整篇四五千字就是几十毫秒，
+     * 还没开工先卡一下。片段遍历是 Qt 自己排好的，快一个数量级。
+     */
     QStringList missingInRange;
+    QSet<QString> missingSeen;
     int affected = 0;
-    for (const auto &range : ranges) {
-        for (int pos = range.first; pos < range.second; ++pos) {
-            QTextCursor one(m_editor->document());
-            one.setPosition(pos);
-            one.setPosition(pos + 1, QTextCursor::KeepAnchor);
-            const QString s = one.selectedText();
-            if (s.isEmpty() || s.at(0).isSpace())
+    for (QTextBlock block = m_editor->document()->begin(); block.isValid(); block = block.next()) {
+        for (QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            if (!fragment.isValid())
                 continue;
-            ++affected;
-            const QString ch = s.left(1);
-            if (!m_library.contains(ch) && !missingInRange.contains(ch))
-                missingInRange.append(ch);
+            const QString text = fragment.text();
+            const int base = fragment.position();
+            for (int i = 0; i < text.size(); ++i) {
+                const int pos = base + i;
+                bool inRange = false;
+                for (const auto &range : ranges) {
+                    if (pos >= range.first && pos < range.second) {
+                        inRange = true;
+                        break;
+                    }
+                }
+                if (!inRange)
+                    continue;
+                const QChar ch = text.at(i);
+                if (ch.isSpace())
+                    continue;
+                ++affected;
+                const QString one(ch);
+                if (!m_library.contains(one) && !missingSeen.contains(one)) {
+                    missingSeen.insert(one);
+                    missingInRange.append(one);
+                }
+            }
         }
     }
 
@@ -1976,49 +2542,65 @@ void MainWindow::applyHandwriting()
             return;
     }
 
+    if (!canStartEditJob(tr("铺手写笔迹")))
+        return;
+
     // 每次应用换一批样本，同一次应用内同一个字也是同一个样本（稳定）
     m_seed = QRandomGenerator::global()->generate();
-    applyEffectToRanges(ranges, EffectKind::Handwriting, true);
-    showEffectLayer(EffectKind::Handwriting);
-
-    const QStringList missingAll = collectMissingHandwriting();
-    QString message = tr("已为 %1 个字符铺上手写笔迹").arg(affected);
-    if (!missingAll.isEmpty()) {
-        message += tr("；全文仍有 %1 个字符缺数据：%2")
-                       .arg(missingAll.size())
-                       .arg(joinCharList(missingAll));
-    }
-    statusBar()->showMessage(message, 12000);
-    updateStatus();
+    const quint32 seed = m_seed;
+    /*!
+     * 真正改格式的活（可能几千个字）交给调度器分片做：
+     * 界面不白、状态栏有进度、Esc 能取消，取消时已改的部分会写回去。
+     */
+    startEffectStyleJob(
+        ranges, tr("铺手写笔迹"), EffectKind::Handwriting,
+        /*clear=*/false, /*clearAllKinds=*/false, /*perChar=*/true, seed,
+        [this, wholeDocument](int applied, int noiseOnHandwriting, bool cancelled) {
+            Q_UNUSED(noiseOnHandwriting);
+            if (cancelled) {
+                statusBar()->showMessage(tr("已取消铺手写笔迹（改动已撤回）"), 6000);
+                updateStatus();
+                return;
+            }
+            showEffectLayer(EffectKind::Handwriting);
+            const QStringList missingAll = collectMissingHandwriting();
+            QString message = wholeDocument
+                                  ? tr("未选中文字，已为「全文」%1 个字符铺上手写笔迹").arg(applied)
+                                  : tr("已为 %1 个字符铺上手写笔迹").arg(applied);
+            if (!missingAll.isEmpty()) {
+                message += tr("；全文仍有 %1 个字符缺数据：%2")
+                               .arg(missingAll.size())
+                               .arg(joinCharList(missingAll));
+            }
+            statusBar()->showMessage(message, 12000);
+            updateStatus();
+        });
 }
 
+/*!
+ * 取消手写效果（只动手写那一种，扭曲照旧）。
+ *
+ * 和铺手写一样是逐字的碎活，同样分片做：状态栏有进度，Esc 能取消。
+ */
 void MainWindow::clearHandwriting()
 {
     const QVector<QPair<int, int>> ranges = effectRanges();
-    int cleared = 0;
-    QTextCursor work(m_editor->document());
-    work.beginEditBlock();
-    for (const auto &range : ranges) {
-        for (int pos = range.first; pos < range.second; ++pos) {
-            QTextCursor one(m_editor->document());
-            one.setPosition(pos);
-            one.setPosition(pos + 1, QTextCursor::KeepAnchor);
-            if (effectStyle(one.charFormat()).kind != EffectKind::Handwriting)
-                continue;
-            // 把原格式整体写回去、只是不带效果属性：
-            // mergeCharFormat 不会因为"补丁里没有这个属性"就删掉它。
-            QTextCharFormat fmt = one.charFormat();
-            setEffectStyle(&fmt, EffectStyle());
-            one.setCharFormat(fmt);
-            ++cleared;
-        }
-    }
-    work.endEditBlock();
+    if (!canStartEditJob(tr("取消手写效果")))
+        return;
 
-    m_editor->setEffectOptions(buildRenderOptions());
-    m_editor->viewport()->update();
-    statusBar()->showMessage(tr("已取消 %1 个字符的手写效果").arg(cleared), 6000);
-    updateStatus();
+    startEffectStyleJob(
+        ranges, tr("取消手写效果"), EffectKind::Handwriting, /*clear=*/true,
+        /*clearAllKinds=*/false, /*perChar=*/false, m_seed,
+        [this](int applied, int noiseOnHandwriting, bool cancelled) {
+            Q_UNUSED(noiseOnHandwriting);
+            m_editor->setEffectOptions(buildRenderOptions());
+            m_editor->viewport()->update();
+            statusBar()->showMessage(cancelled
+                                         ? tr("已取消（改动已撤回）")
+                                         : tr("已取消 %1 个字符的手写效果").arg(applied),
+                                     6000);
+            updateStatus();
+        });
 }
 
 void MainWindow::showHandwritingLib()
@@ -2237,50 +2819,21 @@ double MainWindow::waveScale() const
     return m_waveScaleSpin ? m_waveScaleSpin->value() : 2.0;
 }
 
-MainWindow::EffectApplyResult MainWindow::applyEffectToRanges(const QVector<QPair<int, int>> &ranges,
-                                                             EffectKind kind,
-                                                             bool perChar)
-{
-    EffectApplyResult result;
-    if (ranges.isEmpty())
-        return result;
-
-    QTextCursor work(m_editor->document());
-    work.beginEditBlock();
-    for (const auto &range : ranges) {
-        for (int pos = range.first; pos < range.second; ++pos) {
-            QTextCursor one(m_editor->document());
-            one.setPosition(pos);
-            one.setPosition(pos + 1, QTextCursor::KeepAnchor);
-
-            /*!
-             * 套扭曲时，已经有手写的字符**保留手写**（见 distortionEffectKind）：
-             * 噪声加到手写笔迹上，而不是把手写换成"原字体 + 噪声"。
-             *
-             * 种子照样换一个新的：手写层的噪声波是按字符种子现生成的
-             * （见 renderEffects 里的 localWave），换了种子就换了一种抖法 ——
-             * "换一条噪声波并重新扭曲"因此对手写同样有效。
-             */
-            EffectStyle style;
-            style.kind = (kind == EffectKind::Distortion)
-                             ? distortionEffectKind(one.charFormat())
-                             : kind;
-            style.seed = perChar ? (m_seed + quint32(pos) * 2654435761u) : m_seed;
-
-            QTextCharFormat fmt;
-            setEffectStyle(&fmt, style);
-            one.mergeCharFormat(fmt);
-
-            ++result.applied;
-            if (kind == EffectKind::Distortion && style.kind == EffectKind::Handwriting)
-                ++result.noiseOnHandwriting;
-        }
-    }
-    work.endEditBlock();
-
-    return result;
-}
-
+/*!
+ * 给一批区间套效果、或者清掉效果（**都在后台分片做**）。
+ *
+ * 以前这里是两个直接的循环（`applyEffectToRanges` / 各个 clear*），
+ * 两千个字 78ms、两万字 800ms，而且**改完之后那一次重绘更贵**：
+ * 每个字都要算一遍变形后的字形（实测 585ms，见 tests/bench_effects.cpp）。
+ *
+ * 现在：
+ *   - 改格式 -> `startEffectStyleJob()`（状态栏有进度，Esc 能取消）；
+ *   - 算几何 -> 视图发现"有活"就转给 `EffectWorkJob`，同样是分片 + 进度。
+ * 两件事都不再发生在"必须立刻返回"的地方。
+ */
+/*!
+ * 打开对应的显示开关（套了效果却看不见就很迷惑，所以自动开）。
+ */
 void MainWindow::showEffectLayer(EffectKind kind)
 {
     if (kind == EffectKind::Handwriting)
@@ -2296,139 +2849,202 @@ void MainWindow::showEffectLayer(EffectKind kind)
     m_editor->updateOverlayGeometry();
 }
 
+/*!
+ * 给选中文字套"笔画扭曲"（= 加噪声）。
+ *
+ * 分两步，**两步都是后台分片做的**：
+ *   1. 换一条噪声波 + 逐字写效果数据（`EffectStyleJob`）；
+ *   2. 视图发现几何没算好 -> `EffectWorkJob` 逐段算字形。
+ * 用户看到的是：状态栏一条进度条走完，文字一片一片地变成扭曲字形，
+ * 全程窗口都能动、能取消。
+ */
 void MainWindow::applyDistortion()
 {
-    const QVector<QPair<int, int>> ranges = effectRanges();
-    const QTextCursor cursor = m_editor->textCursor();
-    if (!cursor.hasSelection() && m_regexRanges.isEmpty()) {
-        QMessageBox::information(this, tr("笔画扭曲"),
-                                 tr("请先选中一段文字。\n\n"
-                                    "提示：可以先用「一键选中所有中文 / 英文」选中整篇文字。"));
+    /*!
+     * 没选区就是**全文**（用户要的就是这个）。
+     *
+     * 这里从前弹一个"请先选中一段文字"的模态对话框，把"Ctrl+D 加噪声"
+     * 变成了"先得手选一段"。代价是可能一不小心给整篇加噪声 ——
+     * 但它一次 Ctrl+Z 就能全撤，而且状态栏会明说"作用于全文"。
+     */
+    bool wholeDocument = false;
+    const QVector<QPair<int, int>> ranges = effectRanges(&wholeDocument);
+    if (!canStartEditJob(tr("笔画扭曲")))
         return;
-    }
 
     // 每次应用换一条噪声波 —— 这就是"随机扭曲"的来源
     m_seed = QRandomGenerator::global()->generate();
     m_wave.reseed(m_seed);
-
-    const EffectApplyResult result = applyEffectToRanges(ranges, EffectKind::Distortion, true);
-
-    /*!
-     * 显示开关按"实际被改了哪种字"来切：
-     *   - 有字的字形被换成扭曲字形 → 开扭曲层；
-     *   - 全都是保留手写、噪声加在笔迹上的 → 开手写层（不然屏幕上看不见变化）。
-     * 两层同时有内容时按"扭曲"显示（手写层照旧画，见 planEffects：
-     * 两种 kind 各自成一项，互不影响）。
-     */
-    if (result.distorted() > 0)
-        showEffectLayer(EffectKind::Distortion);
-    else if (result.noiseOnHandwriting > 0)
-        showEffectLayer(EffectKind::Handwriting);
+    const quint32 seed = m_seed;
 
     int affected = 0;
     for (const auto &range : ranges)
         affected += range.second - range.first;
+    const double amplitude = randomAmplitudePt();
+    const double cycles = waveScale();
 
-    QString message =
-        tr("已把平缓噪声波叠加到 %1 个字符上（幅度 %2 pt，波数 %3）")
-            .arg(affected)
-            .arg(randomAmplitudePt())
-            .arg(waveScale());
-    if (result.noiseOnHandwriting > 0) {
-        message += result.distorted() > 0
-                       ? tr("；其中 %1 个是手写笔迹（噪声加在笔迹上，不再是原字体）")
-                             .arg(result.noiseOnHandwriting)
-                       : tr("；这些字都是手写笔迹，噪声加在笔迹上（保持手写，没换回原字体）");
-    }
-    statusBar()->showMessage(message, 10000);
-    updateStatus();
+    startEffectStyleJob(
+        ranges, tr("笔画扭曲"), EffectKind::Distortion, /*clear=*/false, /*clearAllKinds=*/false,
+        /*perChar=*/true, seed,
+        [this, affected, amplitude, cycles, wholeDocument](int applied, int noiseOnHandwriting,
+                                                          bool cancelled) {
+            if (cancelled) {
+                statusBar()->showMessage(tr("已取消笔画扭曲（改动已撤回）"), 6000);
+                updateStatus();
+                return;
+            }
+            /*!
+             * 显示开关按"实际被改了哪种字"来切：
+             *   - 有字的字形被换成扭曲字形 -> 开扭曲层；
+             *   - 全都是保留手写、噪声加在笔迹上的 -> 开手写层（不然屏幕上看不见变化）。
+             * 两层同时有内容时按"扭曲"显示（两种 kind 各自成一项，互不影响）。
+             */
+            const int distorted = applied - noiseOnHandwriting;
+            if (distorted > 0)
+                showEffectLayer(EffectKind::Distortion);
+            else if (noiseOnHandwriting > 0)
+                showEffectLayer(EffectKind::Handwriting);
+
+            /*!
+             * 全文兜底时要说出来。
+             *
+             * "没选中 = 全文"这个默认很好用，但用户必须看得见它发生了 ——
+             * 不然"我只想改一段，怎么整篇都抖了"会变成一个惊吓。
+             */
+            QString message = wholeDocument
+                                  ? tr("未选中文字，已把噪声波叠加到「全文」%1 个字符上（幅度 %2 pt，"
+                                       "波数 %3）")
+                                        .arg(affected)
+                                        .arg(amplitude)
+                                        .arg(cycles)
+                                  : tr("已把平缓噪声波叠加到 %1 个字符上（幅度 %2 pt，波数 %3）")
+                                        .arg(affected)
+                                        .arg(amplitude)
+                                        .arg(cycles);
+            if (noiseOnHandwriting > 0) {
+                message += distorted > 0
+                               ? tr("；其中 %1 个是手写笔迹（噪声加在笔迹上，不再是原字体）")
+                                     .arg(noiseOnHandwriting)
+                               : tr("；这些字都是手写笔迹，噪声加在笔迹上（保持手写，没换回原字体）");
+            }
+            statusBar()->showMessage(message, 10000);
+            updateStatus();
+        });
 }
 
 void MainWindow::reseedAndApply()
 {
     m_seed = QRandomGenerator::global()->generate();
     m_wave.reseed(m_seed);
+    const quint32 seed = m_seed;
 
     const QVector<QPair<int, int>> ranges = effectRanges();
     const QTextCursor cursor = m_editor->textCursor();
     const bool hasTarget = cursor.hasSelection() || !m_regexRanges.isEmpty();
 
-    if (hasTarget) {
-        const EffectApplyResult result = applyEffectToRanges(ranges, EffectKind::Distortion, true);
-        if (result.distorted() > 0)
-            showEffectLayer(EffectKind::Distortion);
-        else if (result.noiseOnHandwriting > 0)
-            showEffectLayer(EffectKind::Handwriting);
-
-        if (result.noiseOnHandwriting > 0 && result.distorted() == 0) {
-            statusBar()->showMessage(
-                tr("已换一条噪声波：选中的字都是手写笔迹，噪声加在笔迹上（手写保留）"), 8000);
-        } else {
-            statusBar()->showMessage(tr("已换一条噪声波并在选中内容上重新扭曲"), 8000);
-        }
-    } else {
-        statusBar()->showMessage(tr("已换一条噪声波（Ctrl+D 把它叠加到选中文字上）"), 8000);
-    }
-
-    if (m_showDistortion || hasTarget) {
+    if (!hasTarget) {
+        // 波形变了：选项一交下去，算好的几何就全作废（手写笔迹的抖动也跟着变）
         m_editor->setEffectOptions(buildRenderOptions());
         m_editor->viewport()->update();
         m_editor->updateOverlayGeometry();
+        statusBar()->showMessage(tr("已换一条噪声波（Ctrl+D 把它叠加到选中文字上）"), 8000);
+        updateStatus();
+        return;
     }
-    updateStatus();
+
+    if (!canStartEditJob(tr("重新扭曲")))
+        return;
+
+    startEffectStyleJob(
+        ranges, tr("重新扭曲"), EffectKind::Distortion, /*clear=*/false, /*clearAllKinds=*/false,
+        /*perChar=*/true, seed,
+        [this](int applied, int noiseOnHandwriting, bool cancelled) {
+            if (cancelled) {
+                statusBar()->showMessage(tr("已取消重新扭曲（改动已撤回）"), 6000);
+                updateStatus();
+                return;
+            }
+            const int distorted = applied - noiseOnHandwriting;
+            if (distorted > 0)
+                showEffectLayer(EffectKind::Distortion);
+            else if (noiseOnHandwriting > 0)
+                showEffectLayer(EffectKind::Handwriting);
+
+            if (noiseOnHandwriting > 0 && distorted == 0) {
+                statusBar()->showMessage(
+                    tr("已换一条噪声波：选中的字都是手写笔迹，噪声加在笔迹上（手写保留）"), 8000);
+            } else {
+                statusBar()->showMessage(tr("已换一条噪声波并在选中内容上重新扭曲"), 8000);
+            }
+            updateStatus();
+        });
 }
 
 void MainWindow::clearDistortion()
 {
+    // 没选区 = 全文（见 effectRanges 的说明），所以这里不再报"没有选区"
     const QVector<QPair<int, int>> ranges = effectRanges();
-    int cleared = 0;
-    QTextCursor work(m_editor->document());
-    work.beginEditBlock();
-    for (const auto &range : ranges) {
-        for (int pos = range.first; pos < range.second; ++pos) {
-            QTextCursor one(m_editor->document());
-            one.setPosition(pos);
-            one.setPosition(pos + 1, QTextCursor::KeepAnchor);
-            if (effectStyle(one.charFormat()).kind != EffectKind::Distortion)
-                continue;
-            QTextCharFormat fmt = one.charFormat();
-            setEffectStyle(&fmt, EffectStyle());
-            one.setCharFormat(fmt);
-            ++cleared;
-        }
-    }
-    work.endEditBlock();
+    if (!canStartEditJob(tr("取消笔画扭曲")))
+        return;
 
-    m_editor->setEffectOptions(buildRenderOptions());
-    m_editor->viewport()->update();
-    if (cleared > 0) {
-        statusBar()->showMessage(tr("已取消 %1 个字符的笔画扭曲").arg(cleared), 6000);
-    } else {
-        /*!
-         * 一个都没取消时要说清楚为什么：
-         * 手写笔迹本来就在抖（噪声加在笔迹上，见 renderEffects），
-         * 那是「噪声幅度」管的，不是"扭曲"这个效果 —— 否则用户会以为按钮坏了。
-         */
-        statusBar()->showMessage(tr("选中的字里没有扭曲的字形；手写笔迹的抖动归「噪声幅度」管，"
-                                    "调到 0 pt 就没有抖动"),
-                                 8000);
-    }
-    updateStatus();
+    startEffectStyleJob(
+        ranges, tr("取消笔画扭曲"), EffectKind::Distortion, /*clear=*/true,
+        /*clearAllKinds=*/false, /*perChar=*/false, m_seed,
+        [this](int applied, int noiseOnHandwriting, bool cancelled) {
+            Q_UNUSED(noiseOnHandwriting);
+            m_editor->setEffectOptions(buildRenderOptions());
+            m_editor->viewport()->update();
+            if (cancelled) {
+                statusBar()->showMessage(tr("已取消（改动已撤回）"), 6000);
+            } else if (applied > 0) {
+                statusBar()->showMessage(tr("已取消 %1 个字符的笔画扭曲").arg(applied), 6000);
+            } else {
+                /*!
+                 * 一个都没取消时要说清楚为什么：
+                 * 手写笔迹本来就在抖（噪声加在笔迹上），那是「噪声幅度」管的，
+                 * 不是"扭曲"这个效果 —— 否则用户会以为按钮坏了。
+                 */
+                statusBar()->showMessage(
+                    tr("这里没有扭曲的字形；手写笔迹的抖动归「噪声幅度」管，调到 0 pt 就没有抖动"),
+                    8000);
+            }
+            updateStatus();
+        });
 }
 
+/*!
+ * 清掉选中文字的手写 + 扭曲（两种一起清）。
+ */
 void MainWindow::clearSelectionEffects()
 {
-    QTextCursor cursor = m_editor->textCursor();
-    if (!cursor.hasSelection()) {
-        statusBar()->showMessage(tr("没有选区，未清除任何效果"), 4000);
+    /*!
+     * 没选区 = 全文（和套效果那边一致）。
+     *
+     * 从前这里只说一句"没有选区，未清除任何效果" —— 而旁边的
+     * 【取消手写】/【取消扭曲】本来就作用于全文，四个按钮里只有它要求先选，
+     * 用户完全没法从界面上看出区别。现在四个一致：没选中就是全文。
+     */
+    bool wholeDocument = false;
+    const QVector<QPair<int, int>> ranges = effectRanges(&wholeDocument);
+    if (!canStartEditJob(tr("清除效果")))
         return;
-    }
-    clearEffects(&cursor);
-    m_editor->setTextCursor(cursor);
-    m_editor->setEffectOptions(buildRenderOptions());
-    m_editor->viewport()->update();
-    statusBar()->showMessage(tr("已清除选中文字的手写与扭曲效果"), 6000);
-    updateStatus();
+    startEffectStyleJob(
+        ranges, tr("清除效果"), EffectKind::Handwriting, /*clear=*/true,
+        /*clearAllKinds=*/true, /*perChar=*/false, m_seed,
+        [this, wholeDocument](int applied, int noiseOnHandwriting, bool cancelled) {
+            Q_UNUSED(noiseOnHandwriting);
+            m_editor->setEffectOptions(buildRenderOptions());
+            m_editor->viewport()->update();
+            QString message;
+            if (cancelled)
+                message = tr("已取消（改动已撤回）");
+            else if (wholeDocument)
+                message = tr("未选中文字，已清除「全文」%1 个字符的手写与扭曲效果").arg(applied);
+            else
+                message = tr("已清除 %1 个字符的手写与扭曲效果").arg(applied);
+            statusBar()->showMessage(message, 6000);
+            updateStatus();
+        });
 }
 
 void MainWindow::onEffectsToggled()

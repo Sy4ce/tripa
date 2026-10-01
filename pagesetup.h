@@ -9,9 +9,11 @@
 #include <QString>
 #include <QVector>
 
+class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
+class QLineEdit;
 class QPrinter;
 class QRadioButton;
 class QSpinBox;
@@ -43,6 +45,19 @@ struct PageSetup
     double marginRightMm = 20.0;
     double marginBottomMm = 20.0;
     double gutterMm = 0.0;      //!< 装订线，附加在左侧页边距上
+
+    /*!
+     * 页眉页脚：**默认两个都不显示**。
+     *
+     * 它们是"要才开"的东西，不属于排版本身：画在纸的上/下边距里，
+     * 占不到正文窗口，所以开不开都不会让文字重排。
+     * 文字里可以用 `{page}`（当前页，从 1 起）、`{pages}`（总页数）、`{title}`。
+     */
+    bool headerEnabled = false;
+    QString headerText = QStringLiteral("{title}");
+    bool footerEnabled = false;
+    QString footerText = QStringLiteral("第 {page} 页 / 共 {pages} 页");
+    double chromeFontSizePt = 9.0; //!< 页眉页脚字号（磅）
 
     //! 预览 / 排版用的分辨率
     static constexpr double kDpi = 96.0;
@@ -107,6 +122,12 @@ private:
     QDoubleSpinBox *m_rightSpin = nullptr;
     QDoubleSpinBox *m_bottomSpin = nullptr;
     QDoubleSpinBox *m_gutterSpin = nullptr;
+    // 页眉页脚（默认两个都不勾）
+    QCheckBox *m_headerCheck = nullptr;
+    QLineEdit *m_headerEdit = nullptr;
+    QCheckBox *m_footerCheck = nullptr;
+    QLineEdit *m_footerEdit = nullptr;
+    QDoubleSpinBox *m_chromeFontSpin = nullptr;
     QLabel *m_preview = nullptr;
     QLabel *m_summaryLabel = nullptr;
     QStackedWidget *m_previewStack = nullptr;
