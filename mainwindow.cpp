@@ -2,6 +2,7 @@
 
 #include "effect.h"
 #include "baselineadjust.h"
+#include "capturedialog.h"
 #include "fontspool.h"
 #include "noise.h"
 #include "pagesetup.h"
@@ -53,6 +54,7 @@
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QStyle>
 #include <QTextBlock>
@@ -741,6 +743,12 @@ void MainWindow::buildActions()
     connect(clearRandomFontAct, &QAction::triggered, this, &MainWindow::clearRandomFonts);
 
     // 手写
+    QAction *captureHwAct = addAction(tr("录入手写数据…"), "act_capturehw");
+    captureHwAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+G")));
+    captureHwAct->setToolTip(tr("打开手写录入：在格子里写字、填上写的是什么字，导出成 getpattern 同格式的 CSV。\n"
+                                "用数位笔写的话，笔压会逐点记进 CSV 第 3 列。"));
+    connect(captureHwAct, &QAction::triggered, this, &MainWindow::openHandwritingCapture);
+
     QAction *loadHwAct = addAction(tr("载入手写数据（CSV 目录）…"), "act_loadhw");
     connect(loadHwAct, &QAction::triggered, this, &MainWindow::loadHandwritingFromDir);
 
@@ -847,6 +855,7 @@ void MainWindow::buildMenus()
     hwMenu->addAction(act("act_applyhw"));
     hwMenu->addAction(act("act_clearhw"));
     hwMenu->addSeparator();
+    hwMenu->addAction(act("act_capturehw"));
     hwMenu->addAction(act("act_loadhw"));
     hwMenu->addAction(act("act_reloadhw"));
     hwMenu->addAction(act("act_lib"));
@@ -911,13 +920,15 @@ void MainWindow::buildMenus()
     QAction *aboutAct = helpMenu->addAction(tr("关于 tripa"));
     connect(aboutAct, &QAction::triggered, this, [this] {
         QMessageBox::about(this, tr("关于 tripa"),
-                           tr("<h3>tripa 排版器</h3>"
+                           tr(QStringLiteral("<h3>tripa 排版器</h3>"
+                              "<h4>Version %1</h4>"
                               "<p>文本排版 + 手写笔迹 + 笔画扭曲 + 一键打印。</p>"
-                              "<p>手写数据使用 getpattern 项目导出的 CSV 格式：<br>"
+                              "<p>手写数据用内置的「手写 → 录入手写数据…」（Ctrl+Shift+G）采集，"
+                              "导出的 CSV 与 getpattern 项目同格式：<br>"
                               "第 1 行是字符标签，之后每行 <code>x,y,pressure</code>，"
                               "空行分隔笔画。</p>"
                               "<p>把 CSV 放到程序目录的 <code>handwrite/</code> 下，"
-                              "或用「载入手写数据」指定目录。</p>"));
+                              "或用「载入手写数据」指定目录。</p>").arg(VERSION).toUtf8().data()));
     });
 }
 
@@ -1060,8 +1071,8 @@ void MainWindow::buildToolBars()
         if (m_showHandwriting && m_library.characterCount() == 0) {
             QMessageBox::warning(this, tr("没有手写数据"),
                                  tr("还没有载入手写数据，无法显示手写效果。\n\n"
-                                    "请用「手写 → 载入手写数据（CSV 目录）」"
-                                    "指定 getpattern 导出的 CSV 所在目录。"));
+                                    "可以用「手写 → 录入手写数据…」现场采几个字，"
+                                    "或用「手写 → 载入手写数据（CSV 目录）」指定 CSV 所在目录。"));
         }
         // 同步菜单里的勾选状态
         if (auto *a = findChild<QAction *>(QStringLiteral("act_showhw"))) {
@@ -1265,6 +1276,14 @@ void MainWindow::buildSelectionDock()
     auto *libButton = new QPushButton(tr("查看 / 校对数据…"), panel);
     connect(libButton, &QPushButton::clicked, this, &MainWindow::showHandwritingLib);
     layout->addWidget(libButton);
+
+    /*
+     * 采集入口放到侧栏（而不只在菜单里）：“库里缺这些字”这个念头一起，
+     * 手边就得有个能直接开始的按钮，否则人会去找 getpattern。
+     */
+    auto *captureButton = new QPushButton(tr("录入手写数据（Ctrl+Shift+G）…"), panel);
+    connect(captureButton, &QPushButton::clicked, this, &MainWindow::openHandwritingCapture);
+    layout->addWidget(captureButton);
 
     auto *loadButton = new QPushButton(tr("载入手写数据（CSV 目录）…"), panel);
     connect(loadButton, &QPushButton::clicked, this, &MainWindow::loadHandwritingFromDir);
@@ -2334,12 +2353,35 @@ QStringList MainWindow::handwritingDirCandidates()
 
 void MainWindow::loadHandwritingOnStartup()
 {
+    rebuildHandwritingLibrary(QString());
+}
+
+void MainWindow::rebuildHandwritingLibrary(const QString &primaryDir)
+{
+    /*!
+     * 整个库重建（先 clear），而不是往现有库里追加。
+     *
+     * 追加会出一个很难发现的错：同一个 CSV 被载两遍，样本就多一份
+     * （HandwritingLibrary 按字符存样本，同一个文件载两次就是两份一样的样本），
+     * 而 m_loadedFiles 只去重文件名，界面上完全看不出来。
+     * 刚采完字再载一次是最常见的路径，重建最干净。
+     */
+    m_library.clear();
+
     // 1) 内置数据（qrc:/handwrite/*.csv）
     m_library.loadResourceDir(resourceHandwritingDir());
     m_handwritingDir = resourceHandwritingDir();
 
-    // 2) 程序目录下的 handwrite/，以及已知的数据目录
-    for (const QString &dir : handwritingDirCandidates()) {
+    /*
+     * 2) 主目录（刚采集保存的那个）优先，然后是程序目录下的 handwrite/、
+     *    以及已知的数据目录。
+     */
+    QStringList dirs;
+    if (!primaryDir.isEmpty())
+        dirs << primaryDir;
+    dirs << handwritingDirCandidates();
+
+    for (const QString &dir : dirs) {
         if (!QDir(dir).exists())
             continue;
         const int before = m_library.characterCount();
@@ -2351,6 +2393,70 @@ void MainWindow::loadHandwritingOnStartup()
             break;
         }
     }
+
+    m_editor->setEffectOptions(buildRenderOptions());
+    updateStatus();
+}
+
+QString MainWindow::defaultCaptureDir() const
+{
+    /*
+     * 采集默认存到"现在正在用的手写数据目录"旁边：
+     * 采回来的字和已有的数据放在一起，下次自动加载时一起进来，不会散在别处。
+     * 内置资源（:/handwrite）是只读的，那种情况下退到「文档/handwrite」。
+     */
+    if (!m_handwritingDir.isEmpty() && !m_handwritingDir.startsWith(QLatin1Char(':'))
+        && QDir(m_handwritingDir).exists()) {
+        return m_handwritingDir;
+    }
+    return QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)
+           + QStringLiteral("/handwrite");
+}
+
+void MainWindow::openHandwritingCapture()
+{
+    QSettings settings;
+    QString startDir = settings.value(QStringLiteral("capture/lastDir")).toString();
+    if (startDir.isEmpty() || !QDir(startDir).exists())
+        startDir = defaultCaptureDir();
+
+    /*
+     * 把当前字体给对话框当参考字形（只取字族）。
+     * 用编辑区的字体而不是写死一个：参考字形是拿来"对照这个字长什么样"的，
+     * 和正文用的字体一致才对得上。
+     */
+    HandwritingCaptureDialog dialog(&m_library, startDir, m_editor->font(), this);
+    dialog.exec();
+
+    const QStringList saved = dialog.savedFiles();
+    if (saved.isEmpty())
+        return;
+
+    const QString dir = dialog.lastDirectory();
+    if (!dir.isEmpty())
+        settings.setValue(QStringLiteral("capture/lastDir"), dir);
+
+    if (QMessageBox::question(this, tr("手写数据"),
+                              tr("已保存 %1 个 CSV：\n%2\n\n现在把这个目录载入手写库吗？")
+                                  .arg(saved.size())
+                                  .arg(saved.join(QStringLiteral("\n"))))
+        != QMessageBox::Yes) {
+        return;
+    }
+
+    rebuildHandwritingLibrary(dir);
+
+    /*
+     * 载完不自动铺到选中文字上。铺手写是"改文档"的动作，
+     * 刚采完就默默改一遍全文（没选区时效果操作作用于全文）会让人莫名其妙，
+     * 所以只告诉用户接下去按什么键。
+     */
+    QMessageBox::information(this, tr("手写数据"),
+                             tr("已载入 %1：%2 个字符 / %3 份样本。\n\n"
+                                "选中文字后按 Ctrl+H 就能铺上手写。")
+                                 .arg(dir)
+                                 .arg(m_library.characterCount())
+                                 .arg(m_library.sampleCount()));
 }
 
 void MainWindow::loadHandwritingData()
@@ -2385,8 +2491,8 @@ void MainWindow::loadHandwritingFromDir()
     if (loaded == 0) {
         QMessageBox::warning(this, tr("没有找到手写数据"),
                              tr("目录（含子目录）里没有可用的 CSV：\n%1\n\n"
-                                "CSV 需要是 getpattern 项目导出的格式：\n"
-                                "第 1 行是字符标签，之后每行 x,y,pressure，空行分隔笔画。")
+                                "CSV 需要是指定的手写数据格式（和 getpattern 导出的、"
+                                "以及本程序「录入手写数据…」写出的一致）：\n")
                                  .arg(dir));
         return;
     }
@@ -2475,7 +2581,8 @@ void MainWindow::applyHandwriting()
         QMessageBox::warning(
             this, tr("没有手写数据"),
             tr("还没有载入任何手写数据，无法铺手写笔迹。\n\n"
-               "请用「手写 → 载入手写数据（CSV 目录）」指定 getpattern 导出的 CSV 所在目录。\n\n"
+               "可以用「手写 → 录入手写数据…」现场采几个字，"
+               "或用「手写 → 载入手写数据（CSV 目录）」指定 CSV 所在目录。\n\n"
                "内置数据目录：%1")
                 .arg(resourceHandwritingDir()));
         return;
@@ -2532,8 +2639,8 @@ void MainWindow::applyHandwriting()
             this, tr("手写数据缺失"),
             tr("要铺手写的文字里有 %1 个字符找不到手写数据：\n\n%2\n\n"
                "这些字会保持原字体显示（不会被手写覆盖），其余字符照常铺上手写笔迹。\n"
-               "要补齐数据，请在 getpattern 里采集这些字并导出 CSV，"
-               "再用「载入手写数据」指定目录。\n\n"
+               "要补齐数据，用「手写 → 录入手写数据…」把这些字采一遍就行"
+               "（也可以继续用 getpattern 采，格式一样）。\n\n"
                "仍然继续吗？")
                 .arg(missingInRange.size())
                 .arg(joinCharList(missingInRange)),
@@ -2626,8 +2733,8 @@ void MainWindow::showBaselineAdjust()
 {
     if (m_library.sampleCount() == 0) {
         QMessageBox::information(this, tr("还没有手写数据"),
-                                 tr("先用「手写 → 载入手写数据（CSV 目录）」载入 getpattern "
-                                    "导出的 CSV，再来调基线。"));
+                                 tr("先载入手写数据（「手写 → 录入手写数据…」采几个字，"
+                                    "或「载入手写数据（CSV 目录）」指定目录），再来调基线。"));
         return;
     }
 
@@ -3099,7 +3206,10 @@ void MainWindow::updateStatus()
 
     if (m_libraryLabel) {
         if (m_library.characterCount() == 0) {
-            m_libraryLabel->setText(tr("尚未载入手写数据。\n用下面的按钮指定 getpattern 导出的 CSV 目录。"));
+            // 侧栏这句是“没有数据时”的指路牌：两条路都写清楚，别只提载入目录
+            m_libraryLabel->setText(tr("尚未载入手写数据。\n"
+                                       "用「录入手写数据…」现场采几个字，"
+                                       "或用下面的按钮指定 CSV 目录。"));
         } else {
             QString text = tr("已载入 %1 个字符 / %2 份样本（%3 个 CSV 文件）。")
                                .arg(m_library.characterCount())

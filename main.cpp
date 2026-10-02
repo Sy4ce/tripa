@@ -4,6 +4,8 @@
 #include "effectsrenderer.h"
 #include "effectplanner.h"
 #include "handwriting.h"
+#include "capturedialog.h"
+#include "handwritingcapture.h"
 #include "jobrunner.h"
 #include "pagesetup.h"
 #include "paginatinglayout.h"
@@ -2718,6 +2720,257 @@ static int runCrashDumpProbe(const QString &outDir)
 }
 
 /*!
+ * 手写录入对话框的实测（内置采集，getpattern 的 Qt 版）。
+ *
+ * 跑法：`tripa.exe --uitest <目录> light capture`
+ *
+ * 为什么这件事必须实测、不能只靠单测：
+ *   - **按笔深度是这一路的全部意义**，而“每个点带没带深度”只有真走一遍
+ *     “输入 -> 画板 -> 导出”才能确定；单测喂进去的是现成的点，
+ *     中间那一段（鼠标/数位笔事件、深度追踪器、逐点写入）全是空的；
+ *   - 鼠标输入是**合法**的采集方式，它必须被如实记成“没有笔压”（固定 0.5），
+ *     而不是假装采到了 —— 鼠标事件在自检里能用 QTest 真的造出来，
+ *     数位笔造不出来，所以笔压那一路用注入的笔画验（并注明是注入的）。
+ */
+static int runCaptureDialogProbe(const QString &outDir)
+{
+    QTemporaryDir tmp;
+    if (!tmp.isValid()) {
+        QTextStream(stderr) << "capture 失败：建不出临时目录\n";
+        return 80;
+    }
+
+    int failed = 0;
+    auto check = [&failed](bool ok, const QString &what) {
+        QTextStream(stdout) << "capture: " << (ok ? "ok   " : "FAIL ") << what << "\n";
+        if (!ok)
+            ++failed;
+    };
+
+    // 库里先放一个字：用它验“已有 / 缺”那一列真的有依据
+    HandwritingLibrary library;
+    QString error;
+    library.addCsvText(QStringLiteral("好\n0,0,0.6\n10,0,0.6\n\n10,20,0.6\n"),
+                       QStringLiteral("mem:capture-probe"), &error);
+
+    // ---------------------------------------------------------------- 数位笔那一路（注入：造不出真的笔事件）
+    HandwritingCaptureDialog dialog(&library, tmp.path(), QApplication::font());
+    dialog.resize(1100, 820);
+    dialog.show();
+    for (int i = 0; i < 30; ++i) {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+
+    check(dialog.slotCount() == 12, "默认 12 格");
+    dialog.setSlotCount(6);
+    for (int i = 0; i < 5; ++i)
+        QApplication::processEvents();
+    check(dialog.slotCount() == 6, "改格子数后是 6 格");
+    check(dialog.findChildren<CaptureSlotWidget *>().size() == 6, "网格里正好 6 个画板");
+
+    auto point = [](double x, double y, double depth) {
+        HandwritingPoint p;
+        p.pos = QPointF(x, y);
+        p.pressure = depth;
+        return p;
+    };
+
+    const QVector<QVector<HandwritingPoint>> haoStrokes = {
+        {point(20, 20, 0.20), point(60, 20, 0.42), point(60, 50, 0.30)},
+        {point(25, 70, 0.11)},
+    };
+    dialog.injectStrokes(0, haoStrokes);
+    dialog.setSlotLabel(0, QStringLiteral("好"));
+    dialog.injectStrokes(1, {{{point(220, 20, 0.55), point(260, 20, 0.50)}}});
+    dialog.setSlotLabel(1, QStringLiteral("云"));
+    dialog.injectStrokes(2, {{{point(420, 80, 0.80), point(440, 20, 0.60), point(460, 80, 0.75)}},
+                             {{point(430, 55, 0.45), point(450, 55, 0.45)}}});
+    dialog.setSlotLabel(2, QStringLiteral("A"));
+    for (int i = 0; i < 5; ++i)
+        QApplication::processEvents();
+
+    const QVector<CaptureSlotWidget *> canvases = dialog.findChildren<CaptureSlotWidget *>();
+    check(canvases.size() == 6 && canvases.at(0)->strokeCount() == 2
+              && canvases.at(0)->pointCount() == 4,
+          "第 1 格记下 2 笔 4 点");
+    check(canvases.at(0)->pressureTracker().depthCaptured(), "第 1 格认得出自己采到了真笔压");
+    check(dialog.pressureSummary().contains(QStringLiteral("已采到笔压")),
+          "界面上明说采到了笔压（而不是沉默）");
+    check(dialog.pressureSummary().contains(QStringLiteral("0.11"))
+              && dialog.pressureSummary().contains(QStringLiteral("0.8")),
+          QStringLiteral("笔压范围是真的：%1").arg(dialog.pressureSummary()));
+
+    // 一格一个字：多打、粘进来的都要截掉（标签和笔画序位对不上，整格数据就废了）
+    dialog.setSlotLabel(3, QStringLiteral("好云A"));
+    check(dialog.currentSlots().at(3).label == QStringLiteral("好"),
+          "一格只留一个字（多出来的被截掉）");
+    dialog.setSlotLabel(3, QString());
+
+    // 撤销上一笔
+    QToolButton *undo = nullptr;
+    for (QToolButton *b : dialog.findChildren<QToolButton *>()) {
+        if (b->text().contains(QStringLiteral("撤销")))
+            undo = b;
+    }
+    if (undo) {
+        undo->click();
+        for (int i = 0; i < 3; ++i)
+            QApplication::processEvents();
+        check(canvases.at(0)->strokeCount() == 1, "「撤销上一笔」真的撤掉了一笔");
+    } else {
+        check(false, "找得到「撤销上一笔」按钮");
+    }
+
+    // 把撤销掉的那一笔重新塞回去：下面的往返断言要的是完整的两笔
+    dialog.injectStrokes(0, haoStrokes);
+    for (int i = 0; i < 3; ++i)
+        QApplication::processEvents();
+    check(canvases.at(0)->strokeCount() == 2, "重新注入后回到 2 笔");
+
+    dialog.grab().save(outDir + QStringLiteral("/uitest_capture_dialog.png"));
+    QTextStream(stdout) << "capture: 对话框截图 " << outDir << "/uitest_capture_dialog.png\n";
+
+    // ---------------------------------------------------------------- 导出 -> 读回
+    QStringList written;
+    if (!dialog.saveToDirectory(tmp.path(), false, &written, &error)) {
+        QTextStream(stderr) << "capture 失败：保存失败：" << error << "\n";
+        return 81;
+    }
+    check(written.size() == 1 && QFile::exists(written.first()), "保存出一个 CSV");
+    if (written.size() != 1)
+        return 82;
+
+    QFile csvFile(written.first());
+    csvFile.open(QIODevice::ReadOnly);
+    const QString csv = QString::fromUtf8(csvFile.readAll());
+    csvFile.close();
+    check(csv.startsWith(QStringLiteral("好云A\r\n")), "第 1 行是各格标签拼起来的字符标签");
+    check(!csv.contains(QStringLiteral("\r\r\n")), "行尾没有多出一层 \\r");
+
+    int dataLines = 0;
+    int threeColumns = 0;
+    const QStringList csvLines = csv.split(QStringLiteral("\r\n"));
+    for (int i = 1; i < csvLines.size(); ++i) {
+        if (csvLines.at(i).isEmpty())
+            continue;
+        ++dataLines;
+        if (csvLines.at(i).count(QLatin1Char(',')) == 2)
+            ++threeColumns;
+    }
+    check(dataLines > 0 && dataLines == threeColumns, "每个点都写了第 3 列（按笔深度）");
+
+    HandwritingLibrary back;
+    if (!back.loadFile(written.first(), &error)) {
+        QTextStream(stderr) << "capture 失败：导出的 CSV 载不回来：" << error << "\n";
+        return 83;
+    }
+    check(back.characterCount() == 3, "读回来是 3 个字");
+    const HandwritingSample *hao = back.pick(QStringLiteral("好"), 1u);
+    const HandwritingSample *yun = back.pick(QStringLiteral("云"), 1u);
+    const bool haoShapeOk = hao && hao->strokeCount() == 2 && hao->pointCount() == 4;
+    check(haoShapeOk, "「好」拿到的就是自己那 2 笔 4 点（逐格采集，不用猜）");
+    check(yun && yun->strokeCount() == 1 && yun->pointCount() == 2, "「云」拿到自己那 1 笔");
+    // 先看形状再取点：形状不对时点下标就是越界的（自检自己不能先崩）
+    if (haoShapeOk) {
+        check(qFuzzyCompare(hao->strokes.at(0).at(1).pressure, 0.42),
+              "笔压 0.42 逐点落进了 CSV 第 3 列");
+        check(qFuzzyCompare(hao->strokes.at(1).at(0).pressure, 0.11),
+              "轻笔 0.11 也在（没有被“统一成一个平均宽度”）");
+    } else {
+        check(false, "「好」的形状不对，笔压断言没法做");
+    }
+
+    // 每格一个 CSV
+    const QString perDir = tmp.path() + QStringLiteral("/per");
+    QDir().mkpath(perDir);
+    written.clear();
+    if (!dialog.saveToDirectory(perDir, true, &written, &error)) {
+        QTextStream(stderr) << "capture 失败：每格一个文件保存失败：" << error << "\n";
+        return 84;
+    }
+    check(written.size() == 3, "每格一个 CSV：写出 3 个文件");
+    check(QFile::exists(perDir + QStringLiteral("/好.csv")), "文件名就是那个字");
+
+    // ---------------------------------------------------------------- 鼠标那一路（真的造鼠标事件）
+    {
+        HandwritingCaptureDialog mouseDialog(&library, tmp.path(), QApplication::font());
+        mouseDialog.resize(900, 600);
+        mouseDialog.setSlotCount(2);
+        mouseDialog.show();
+        for (int i = 0; i < 30; ++i) {
+            QApplication::processEvents();
+            QThread::msleep(5);
+        }
+
+        const QVector<CaptureSlotWidget *> mouseCanvases
+            = mouseDialog.findChildren<CaptureSlotWidget *>();
+        if (mouseCanvases.size() != 2) {
+            check(false, "鼠标那一路：拿到 2 个画板");
+            return 85;
+        }
+
+        /*
+         * 真鼠标拖一下。这一路的意义：鼠标**没有压感**，采出来的数据就没有
+         * 按笔深度 —— 程序必须如实说“没有笔压”，而不是填一批假的深度上去。
+         */
+        CaptureSlotWidget *canvas = mouseCanvases.at(0);
+        QTest::mousePress(canvas, Qt::LeftButton, Qt::NoModifier, QPoint(30, 30));
+        QTest::mouseMove(canvas, QPoint(60, 40));
+        QTest::mouseMove(canvas, QPoint(60, 90));
+        QTest::mouseRelease(canvas, Qt::LeftButton, Qt::NoModifier, QPoint(60, 90));
+        for (int i = 0; i < 5; ++i)
+            QApplication::processEvents();
+
+        check(canvas->strokeCount() == 1, "鼠标拖一下 = 一笔");
+        check(canvas->pointCount() >= 2, QStringLiteral("这一笔记下了 %1 个点").arg(canvas->pointCount()));
+        const auto mouseStrokes = canvas->strokes();
+        bool allMouseDepth = !mouseStrokes.isEmpty();
+        for (const auto &stroke : mouseStrokes) {
+            for (const HandwritingPoint &p : stroke)
+                allMouseDepth = allMouseDepth && qFuzzyCompare(p.pressure, kMouseCaptureDepth);
+        }
+        check(allMouseDepth, "鼠标输入的每一点都是固定 0.5（和 getpattern 对鼠标的取值一致）");
+        check(!canvas->pressureTracker().depthCaptured(), "鼠标输入不算“采到笔压”");
+        check(mouseDialog.pressureSummary().contains(QStringLiteral("没有笔压")),
+              QStringLiteral("界面明说没有笔压：%1").arg(mouseDialog.pressureSummary()));
+
+        mouseDialog.setSlotLabel(0, QStringLiteral("z"));
+        const QString mouseDir = tmp.path() + QStringLiteral("/mouse");
+        QDir().mkpath(mouseDir);
+        written.clear();
+        if (!mouseDialog.saveToDirectory(mouseDir, false, &written, &error)) {
+            QTextStream(stderr) << "capture 失败：鼠标数据保存失败：" << error << "\n";
+            return 86;
+        }
+
+        /*
+         * 鼠标采的数据**仍然要带第 3 列**（值是 0.5）：
+         * 少一列，tripa 会走“这份数据没有笔压”的固定线宽那一路，
+         * 而那时用户已经分不清是“采集时没录上”还是“设备不支持”了。
+         */
+        QFile mouseFile(written.value(0));
+        mouseFile.open(QIODevice::ReadOnly);
+        const QString mouseCsv = QString::fromUtf8(mouseFile.readAll());
+        mouseFile.close();
+        check(mouseCsv.contains(QStringLiteral(",0.5")), "鼠标数据也写满 3 列（0.5），不丢列");
+
+        HandwritingLibrary mouseBack;
+        check(mouseBack.loadFile(written.value(0), &error), "鼠标采的 CSV 能载入");
+        const HandwritingSample *mouseSample = mouseBack.pick(QStringLiteral("z"), 1u);
+        check(mouseSample && mouseSample->hasPressure(), "读回来确实带第 3 列");
+        check(mouseSample && qFuzzyCompare(mouseSample->strokes.first().first().pressure, 0.5),
+              "读回来就是 0.5");
+    }
+
+    if (failed > 0) {
+        QTextStream(stderr) << "capture 失败：" << failed << " 项没通过\n";
+        return 89;
+    }
+    QTextStream(stdout) << "capture: 手写录入自检通过（逐格采集 + 按笔深度 + 导出读回）\n";
+    return 0;
+}
+/*!
  * 界面冒烟测试：真正建出主窗口、跑几个回合的事件循环、截图后退出。
  * 用来验证排版控件、效果层、工具栏这些没法用纯逻辑测的部分。
  * 用法： tripa.exe --uitest [输出目录] [light|dark]
@@ -2738,10 +2991,11 @@ static int runCrashDumpProbe(const QString &outDir)
  *   - 扭曲替换：正文行内的原字黑墨必须消失、出现扭曲色墨，且全选后
  *     选区色像素不减少（效果层不许再刷底色盖原字）。
  *
- * 另有两个独立的参数：
+ * 另有几个独立的参数：
  *   - zoom：视图缩放自检（见 runZoomProbe）；
  *   - hwnoise：给手写字加噪声的自检（见 runHandwritingNoiseProbe）；
- *   - pagefix：分页 / 页边距自检（见 runPageLayoutProbe）。
+ *   - pagefix：分页 / 页边距自检（见 runPageLayoutProbe）；
+ *   - capture：手写录入（内置采集）自检（见 runCaptureDialogProbe）。
  */
 static int runUiTest(const QStringList &args)
 {
@@ -2756,6 +3010,7 @@ static int runUiTest(const QStringList &args)
     bool probeProgress = false;
     bool probeSoak = false;
     bool probeCrash = false;
+    bool probeCapture = false;
     QString baselineDir;
     for (int i = 2; i < args.size(); ++i) {
         const QString a = args.at(i).toLower();
@@ -2779,6 +3034,8 @@ static int runUiTest(const QStringList &args)
             probeCrash = true;
         else if (a == QStringLiteral("baseline"))
             probeBaseline = true;
+        else if (a == QStringLiteral("capture"))
+            probeCapture = true;
         else if (a == QStringLiteral("baseline-dir") && i + 1 < args.size())
             baselineDir = args.at(++i); // 用原始大小写的参数：这是路径
     }
@@ -2793,6 +3050,15 @@ static int runUiTest(const QStringList &args)
             return rc;
     }
 
+    /*!
+     * 手写录入对话框的实测也放在建主窗口之前：它自建库、自建临时目录，
+     * 与窗口里的状态互不干扰，也不会被模态对话框挡住。
+     */
+    if (probeCapture) {
+        const int rc = runCaptureDialogProbe(outDir);
+        if (rc != 0)
+            return rc;
+    }
     if (theme == QStringLiteral("dark") || theme == QStringLiteral("light")) {
         const bool dark = theme == QStringLiteral("dark");
         QApplication::setStyle(QStringLiteral("Fusion"));
@@ -4635,7 +4901,7 @@ static int runUiTest(const QStringList &args)
         const QStringList expected = {
             "act_paragraph", "act_color",   "act_clearcolor", "act_randomfont",
             "act_fontpool",  "act_applyhw", "act_distort",    "act_regex",
-            "act_lib",       "act_baseline",
+            "act_lib",       "act_baseline", "act_capturehw",
         };
         QStringList missing;
         for (const QString &name : expected) {

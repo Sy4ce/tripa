@@ -86,6 +86,8 @@ private slots:
     void clearTextColor();
 
     // 手写
+    //! 手写录入（内置采集）：逐格写字 + 填标签 -> 导出 getpattern 同格式的 CSV
+    void openHandwritingCapture();
     void loadHandwritingData();
     void loadHandwritingFromDir();
     void applyHandwriting();
@@ -211,7 +213,16 @@ private:
     static QStringList handwritingDirCandidates();
     //! 启动时自动加载
     void loadHandwritingOnStartup();
-
+    /*!
+     * \brief 把整个手写库重建一遍（先 clear），\a primaryDir 优先加载。
+     *
+     * 空串 = 只按已知目录找（启动时走这条）。
+     * 采集保存完再载入也走这条：同一个 CSV 载两遍会静默地多出一份样本，
+     * 重建比“追加”干净得多。
+     */
+    void rebuildHandwritingLibrary(const QString &primaryDir);
+    //! 采集时默认存到哪个目录（当前手写数据目录，或「文档/handwrite」）
+    QString defaultCaptureDir() const;
     double randomAmplitudePt() const;
     double waveScale() const;
 

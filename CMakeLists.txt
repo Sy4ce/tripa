@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(tripa VERSION 0.4 LANGUAGES CXX)
+project(tripa VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
@@ -56,6 +56,11 @@ set(PROJECT_SOURCES
         baselineadjust.h
         tripadocument.cpp
         tripadocument.h
+        # 手写采集（getpattern 的 Qt 版）：数据层 + 录入对话框
+        handwritingcapture.cpp
+        handwritingcapture.h
+        capturedialog.cpp
+        capturedialog.h
         tripalog.cpp
         tripalog.h
         resources.qrc
@@ -98,6 +103,11 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     )
 endif()
 
+target_compile_definitions(tripa PRIVATE VERSION="${PROJECT_VERSION}"
+                                         VERSION_MAJOR="${PROJECT_VERSION_MAJOR}"
+                                         VERSION_MINOR="${PROJECT_VERSION_MINOR}"
+                                         VERSION_PATCH="${PROJECT_VERSION_PATCH}")
+
 if(MSVC)
     target_compile_options(tripa PRIVATE /utf-8 /W3)
 else()
@@ -133,6 +143,7 @@ endif()
 add_executable(test_core
     tests/test_core.cpp
     handwriting.cpp
+    handwritingcapture.cpp
     noise.cpp
     effect.cpp
 )

@@ -1,10 +1,12 @@
 /*
- * 纯逻辑自检（不需要控件）：CSV 解析、手写库、噪声波、笔画扭曲。
+ * 纯逻辑自检（不需要控件）：CSV 解析、手写库、**手写采集导出**、
+ * 噪声波、笔画扭曲。
  * 直接运行 build/test_core.exe 即可，退出码 0 表示全过。
  */
 
 #include "effect.h"
 #include "handwriting.h"
+#include "handwritingcapture.h"
 #include "noise.h"
 
 #include <QCoreApplication>
@@ -639,6 +641,227 @@ static void testBaselineAdjustments()
           "size=\"0\" 不会把字缩成看不见（钳到下限）");
 }
 
+/*!
+ * 手写采集（getpattern 的 Qt 版）：采到的数据写成 CSV，再被 tripa 读回来。
+ *
+ * 这一组盯的是三件“错了很难在界面上看出来”的事：
+ *   1. **按笔深度真的落到 CSV 第 3 列了** —— 采了半天发现整篇都是 0.5，
+ *      在屏幕上完全看不出来（渲染时那些字依旧粗细均匀）；
+ *   2. **逐格采集的字符边界是确定的** —— 写出去再读回来，每个字拿到的
+ *      必须就是自己那几笔（getpattern 那边靠识别+几何猜，猜错就整体错位）；
+ *   3. **没标签的格子不能被静默写进去** —— 一份“标签比笔画组少”的 CSV
+ *      在 tripa 里只会报一句“标签有 1 个字符，但只有 3 笔”，用户根本不知道
+ *      是哪一格没填。
+ */
+static void testCaptureExport()
+{
+    qInfo().noquote() << "手写采集导出";
+
+    // ------------------------------------------------------------ 数字格式
+    CHECK(formatCaptureNumber(560.0) == QStringLiteral("560"), "整数不带多余的小数点");
+    CHECK(formatCaptureNumber(2030.0) == QStringLiteral("2030"), "大整数不写成科学计数法");
+    CHECK(formatCaptureNumber(0.104) == QStringLiteral("0.104"), "笔压保留 3 位小数");
+    CHECK(formatCaptureNumber(1.0) == QStringLiteral("1"), "1.0 写成 1");
+    CHECK(formatCaptureNumber(-0.0) == QStringLiteral("0"), "-0 写成 0（免得看着像负坐标）");
+    CHECK(formatCaptureNumber(558.6000001) == QStringLiteral("558.6"), "尾部多余的 0 被去掉");
+
+    // ------------------------------------------------------------ 笔压追踪
+    {
+        CapturePressureTracker tracker;
+        tracker.noteTabletEvent();
+        /*!
+         * 第一帧就报 0 时**不能**当成“很轻的一笔”：
+         * 到这一刻程序还不知道这台设备到底报不报压感（不少手写笔只报位置、
+         * 永远报 0），写 0.05 就意味着整篇字细得几乎看不见，
+         * 而界面上却还在说“没有笔压，全部按 0.5 记” —— 说的和存的不是一回事。
+         * 所以：没见过真笔压之前一律 0.5（“不知道”），见过了才把 0 当成驱动抽风。
+         */
+        const double first = tracker.record(0.0);
+        CHECK(qFuzzyCompare(first, kMouseCaptureDepth),
+              "还没见过真笔压时，报 0 按 0.5 记（不猜成极轻的一笔）");
+        CHECK(!tracker.depthCaptured(), "单帧报 0 不算“采到笔压”");
+
+        const double light = tracker.record(0.18);
+        const double heavy = tracker.record(0.83);
+        const double over = tracker.record(1.4);
+        CHECK(qFuzzyCompare(light, 0.18) && qFuzzyCompare(heavy, 0.83), "真笔压原样记下");
+        CHECK(qFuzzyCompare(over, 1.0), "越界的笔压被鉗到 1.0");
+        CHECK(tracker.depthCaptured(), "采到真笔压后 depthCaptured 为真");
+        CHECK(qFuzzyCompare(tracker.minDepth(), 0.18) && qFuzzyCompare(tracker.maxDepth(), 1.0),
+              "笔压范围只统计设备真的报出来的值");
+
+        // 已经证实有压感之后又报 0（落笔第一帧、驱动抖动）：写成下限，
+        // 而不是写 0 —— 线宽 = 笔压 × 字号 × 系数，写 0 这一笔就断了
+        CHECK(qFuzzyCompare(tracker.record(0.0), kMinPenDepth),
+              "已确认有压感的设备再报 0 -> 写成下限（这一笔不能没墨）");
+        CHECK(qFuzzyCompare(tracker.minDepth(), 0.18),
+              "那一下不参与 min/max（它不是设备真的报出来的深度）");
+
+        // 鼠标：不能把“没有压感”写成 kMinPenDepth，也不能让 depthCaptured 变真
+        CapturePressureTracker mouseOnly;
+        CHECK(qFuzzyCompare(mouseOnly.recordMouse(), kMouseCaptureDepth), "鼠标固定写 0.5");
+        CHECK(!mouseOnly.depthCaptured(), "鼠标输入不算“采到笔压”");
+        CHECK(mouseOnly.summary().contains(QStringLiteral("没有笔压")), "告诉用户这份数据没有笔压");
+
+        // 一笔用笔、一笔用鼠标：鼠标那一笔不能变成 0.05（recoord(0) 的经典坑）
+        CapturePressureTracker mixed;
+        mixed.record(0.42);
+        CHECK(qFuzzyCompare(mixed.recordMouse(), kMouseCaptureDepth),
+              "先用笔后用鼠标，鼠标那一笔仍然是 0.5");
+    }
+
+    // ------------------------------------------------------------ 导出 / 读回
+    QTemporaryDir tmp;
+    CHECK(tmp.isValid(), "建立临时目录");
+    const QDir root(tmp.path());
+
+    CaptureSlot hao;
+    hao.label = QStringLiteral("好");
+    hao.strokes = {
+        {{QPointF(100.0, 100.0), 0.20}, {QPointF(140.0, 100.0), 0.42}, {QPointF(140.0, 130.0), 0.30}},
+        {{QPointF(105.0, 150.0), 0.11}},
+    };
+
+    CaptureSlot yun;
+    yun.label = QStringLiteral("云");
+    yun.strokes = {
+        {{QPointF(300.0, 100.0), 0.55}, {QPointF(340.0, 100.0), 0.50}},
+    };
+
+    CaptureSlot letterA;
+    letterA.label = QStringLiteral("A");
+    letterA.strokes = {
+        {{QPointF(500.0, 160.0), 0.80}, {QPointF(520.0, 100.0), 0.60}, {QPointF(540.0, 160.0), 0.75}},
+        {{QPointF(510.0, 135.0), 0.45}, {QPointF(530.0, 135.0), 0.45}},
+    };
+
+    // 第四格只有笔迹、没标签：必须被排除在外，并且能被点名
+    CaptureSlot unlabelled;
+    unlabelled.strokes = {{{QPointF(700.0, 100.0), 0.5}, {QPointF(720.0, 120.0), 0.5}}};
+
+    const QVector<CaptureSlot> cells{hao, yun, letterA, unlabelled};
+    CHECK(captureExportableSlots(cells) == QVector<int>({0, 1, 2}), "只有填了标签的格子会被导出");
+    CHECK(captureUnlabelledSlots(cells) == QVector<int>({3}), "没标签的格子能被点名（界面上要警告）");
+    CHECK(captureLabelLine(cells) == QStringLiteral("好云A"), "标签行是各格标签拼起来的");
+    CHECK(captureHasDepth(cells), "这份数据带按笔深度");
+
+    const QString csv = captureSlotsToCsv(cells);
+    CHECK(!csv.isEmpty(), "导出得到 CSV 文本");
+    CHECK(csv.startsWith(QStringLiteral("好云A\r\n")), "第 1 行是标签，行尾是 CRLF");
+    CHECK(!csv.contains(QStringLiteral("\r\r\n")), "没有多出一层 \\r");
+    CHECK(csv.contains(QStringLiteral("0,0,0.2")), "原点是全篇第一个点（第一个点就是 0,0）");
+    CHECK(csv.count(QStringLiteral("\r\n\r\n")) >= 2, "字与字之间是两个空行（字符边界）");
+
+    /*
+     * 第 3 列一个都不能少：只要有笔压，每一行都得是 x,y,depth。
+     * 少了列，tripa 会当成“这份数据没有笔压”，走到固定线宽那一路 ——
+     * 用户会以为“采集时笔压没录上”，而其实是被导出除掉了。
+     */
+    int dataLines = 0;
+    int threeColumnLines = 0;
+    const QStringList lines = csv.split(QStringLiteral("\r\n"));
+    for (int i = 1; i < lines.size(); ++i) {
+        if (lines.at(i).isEmpty())
+            continue;
+        ++dataLines;
+        if (lines.at(i).count(QLatin1Char(',')) == 2)
+            ++threeColumnLines;
+    }
+    CHECK(dataLines == 11, "共 11 个点写进文件（4 + 2 + 5）");
+    CHECK(dataLines == threeColumnLines, "每一个点都带了第 3 列（按笔深度）");
+
+    // ------------------------------------------------------------ 读回来
+    HandwritingLibrary library;
+    QString error;
+    CHECK(library.addCsvText(csv, QStringLiteral("mem:capture"), &error),
+          "导出的 CSV 能被 tripa 读回");
+    CHECK(library.characterCount() == 3, "读回来是 3 个字（没标签那一格没混进去）");
+    CHECK(library.contains(QStringLiteral("好")) && library.contains(QStringLiteral("云"))
+              && library.contains(QStringLiteral("A")),
+          "三个字都在库里");
+
+    const HandwritingSample *haoBack = library.pick(QStringLiteral("好"), 1u);
+    const HandwritingSample *yunBack = library.pick(QStringLiteral("云"), 1u);
+    const HandwritingSample *aBack = library.pick(QStringLiteral("A"), 1u);
+    CHECK(haoBack && haoBack->strokeCount() == 2 && haoBack->pointCount() == 4,
+          "「好」拿到的就是自己那 2 笔 4 点");
+    CHECK(yunBack && yunBack->strokeCount() == 1 && yunBack->pointCount() == 2,
+          "「云」拿到的就是自己那 1 笔 2 点");
+    CHECK(aBack && aBack->strokeCount() == 2 && aBack->pointCount() == 5,
+          "「A」拿到的就是自己那 2 笔 5 点");
+
+    // 深度的往返：采集时每个点多少，读回来就得是多少
+    CHECK(haoBack && haoBack->hasPressure(), "读回来的样本带笔压");
+    CHECK(haoBack && qFuzzyCompare(haoBack->strokes.at(0).at(1).pressure, 0.42),
+          "第二点的笔压 0.42 一模一样地回来了");
+    CHECK(haoBack && qFuzzyCompare(haoBack->strokes.at(1).at(0).pressure, 0.11),
+          "第二笔起笔的 0.11 也在（没有笔压的点会整列糊掉，而这里是逐点存的）");
+    CHECK(aBack && qFuzzyCompare(aBack->strokes.at(0).at(0).pressure, 0.8),
+          "重笔 0.8 保留");
+
+    // 逐字归一化是解析器干的，采集端存的是原始像素坐标（相对全篇第一个点）
+    CHECK(haoBack && qFuzzyIsNull(haoBack->bbox().left()) && qFuzzyIsNull(haoBack->bbox().top()),
+          "读回来的样本已归一化到 (0,0)");
+    CHECK(haoBack && qFuzzyCompare(haoBack->bbox().width(), 40.0),
+          "「好」的宽度 40 像素保留");
+
+    // ------------------------------------------------------------ 只存一格
+    const QString oneCsv = captureSlotsToCsv(QVector<CaptureSlot>{yun});
+    HandwritingLibrary single;
+    CHECK(single.addCsvText(oneCsv, QStringLiteral("mem:one"), &error),
+          "单格导出的 CSV 也能读回");
+    CHECK(single.characterCount() == 1 && single.contains(QStringLiteral("云")),
+          "单格里只有「云」一个字");
+
+    // 空格子 / 全空不写
+    CHECK(captureSlotsToCsv(QVector<CaptureSlot>{unlabelled}).isEmpty(),
+          "全是没标签的格子时返回空串（调用方会警告，不会写出一个没标签的文件）");
+    CHECK(captureSlotsToCsv(QVector<CaptureSlot>{}).isEmpty(), "没有格子时返回空串");
+
+    // 全篇没有笔压（老数据/外部喂进来的槽位）时才退回两列
+    CaptureSlot noDepth;
+    noDepth.label = QStringLiteral("z");
+    noDepth.strokes = {{{QPointF(10.0, 10.0), -1.0}, {QPointF(20.0, 20.0), -1.0}}};
+    const QString twoColumn = captureSlotsToCsv(QVector<CaptureSlot>{noDepth});
+    CHECK(!twoColumn.contains(QStringLiteral("0.5")), "整篇没有笔压时不伪造一个 0.5");
+
+    // ------------------------------------------------------------ 文件名
+    auto writeCsv = [](const QString &path, const QString &text) {
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text))
+            return false;
+        f.write(text.toUtf8());
+        f.close();
+        return true;
+    };
+    CHECK(suggestCaptureFileName(tmp.path(), QStringLiteral("handwrite"), QStringLiteral(".csv"))
+              == QStringLiteral("handwrite.csv"),
+          "空目录用默认名");
+    CHECK(writeCsv(root.filePath(QStringLiteral("handwrite.csv")), QStringLiteral("a\n0,0\n")),
+          "先占一个 handwrite.csv");
+    CHECK(suggestCaptureFileName(tmp.path(), QStringLiteral("handwrite"), QStringLiteral(".csv"))
+              == QStringLiteral("handwrite1.csv"),
+          "重名自动避让到 handwrite1.csv（和 getpattern 一个规矩）");
+    CHECK(suggestCaptureFileName(root.filePath(QStringLiteral("没有这个目录")),
+                                 QStringLiteral("handwrite"), QStringLiteral(".csv"))
+              == QStringLiteral("handwrite.csv"),
+          "目录不存在时不乱猜，把默认名给出去");
+
+    CHECK(captureFileStemForLabel(QStringLiteral("好")) == QStringLiteral("好"), "汉字能当文件名");
+    CHECK(captureFileStemForLabel(QStringLiteral("a/b:c")) == QStringLiteral("abc"),
+          "路径非法字符被去掉");
+    CHECK(captureFileStemForLabel(QStringLiteral("   ")) == QStringLiteral("char"),
+          "空白标签退化成 char，不会产生无名文件");
+    CHECK(captureFileStemForLabel(QStringLiteral("x.")) == QStringLiteral("x"),
+          "结尾的点去掉（Windows 上非法）");
+
+    // ------------------------------------------------------------ 采样去重
+    CHECK(!capturePointIsDistinct(QPointF(10.0, 10.0), QPointF(10.2, 10.2)),
+          "同一位置附近的点会被丢掉（高频采样不把数据撞胖）");
+    CHECK(capturePointIsDistinct(QPointF(10.0, 10.0), QPointF(14.0, 10.0)),
+          "真的移动了就记下来");
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -649,6 +872,7 @@ int main(int argc, char *argv[])
     testCharacterGrouping();
     testRecursiveDir();
     testBaselineAdjustments();
+    testCaptureExport();
     testNoise();
     testDistort();
     testEffectFormat();

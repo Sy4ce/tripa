@@ -21,8 +21,8 @@
 IDI_TRIPA ICON "icons\\tripa.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    0,4,0,0
- PRODUCTVERSION 0,4,0,0
+ FILEVERSION    0,5,0,0
+ PRODUCTVERSION 0,5,0,0
  FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
  FILEFLAGS      0x0L
  FILEOS         VOS_NT_WINDOWS32
@@ -34,14 +34,14 @@ BEGIN
         /* 0804 = 简体中文，04b0 = Unicode */
         BLOCK "080404b0"
         BEGIN
-            VALUE "CompanyName",      "tripa"
+            VALUE "CompanyName",      "Sy4ce"
             VALUE "FileDescription",  "tripa 排版工具"
-            VALUE "FileVersion",      "0.4.0.0"
+            VALUE "FileVersion",      "0.5.0"
             VALUE "InternalName",     "tripa"
             VALUE "LegalCopyright",   "tripa"
             VALUE "OriginalFilename", "tripa.exe"
             VALUE "ProductName",      "tripa"
-            VALUE "ProductVersion",   "0.4.0.0"
+            VALUE "ProductVersion",   "0.5.0"
         END
     END
     BLOCK "VarFileInfo"
